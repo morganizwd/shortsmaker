@@ -84,6 +84,8 @@ class MainWindow(QMainWindow):
         self.video_info = None
         self.video_widget = None  # Будет создан в init_ui
         self.player = None  # Будет создан после video_widget
+        self.preview_start_time = None  # Время начала для предпросмотра
+        self.preview_end_time = None  # Время окончания для предпросмотра
         
         self.init_ui()
         self.setup_connections()
@@ -335,6 +337,10 @@ class MainWindow(QMainWindow):
     def _auto_preview(self, video_path: Path, duration: float):
         """Автоматический предпросмотр видео при загрузке."""
         if self.player and self.video_widget:
+            # Сбрасываем ограничения диапазона при автоматической загрузке
+            self.preview_start_time = None
+            self.preview_end_time = None
+            
             # Загружаем видео без ограничения по времени
             self.player.play_file(video_path, 0.0, 0.0)  # 0.0 означает до конца
             # Настраиваем слайдер
@@ -412,15 +418,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Время начала должно быть меньше времени окончания")
             return
         
-        # Загружаем видео полностью, но начинаем с указанного времени
-        self.player.play_file(Path(input_path), start_time, 0.0)  # 0.0 = до конца
+        # Сохраняем диапазон предпросмотра
+        self.preview_start_time = start_time
+        self.preview_end_time = end_time
+        
+        # Загружаем видео с указанным диапазоном
+        self.player.play_file(Path(input_path), start_time, end_time)
         # Настраиваем слайдер для предпросмотра
         if self.video_info:
             duration = self.video_info.get("duration", 0)
             self.timeline_slider.setMaximum(int(duration * 1000))
+            # Устанавливаем слайдер на начало диапазона
+            self.timeline_slider.setValue(int(start_time * 1000))
         self.timeline_slider.setEnabled(True)
         self.position_timer.start(100)
-        self.log(f"Предпросмотр с началом: {start_time_str} - {end_time_str}")
+        self.log(f"Предпросмотр диапазона: {start_time_str} - {end_time_str}")
     
     def process_video(self):
         """Обработка видео."""
@@ -507,13 +519,22 @@ class MainWindow(QMainWindow):
             self.play_pause_btn.setText("▶ Воспроизвести")
             # Не останавливаем таймер, чтобы позиция продолжала обновляться
         else:
-            # Проверяем, не достиг ли конец видео
             current_time = self.player.get_time()
-            length = self.player.get_length()
-            if length > 0 and current_time >= length - 0.1:
-                # Если достигли конца, начинаем с начала
-                self.player.set_time(0.0)
-                self.timeline_slider.setValue(0)
+            
+            # Если есть ограничение диапазона предпросмотра, проверяем его
+            if self.preview_end_time is not None and current_time >= self.preview_end_time:
+                # Если достигли конца диапазона, начинаем с начала диапазона
+                start = self.preview_start_time if self.preview_start_time is not None else 0.0
+                self.player.set_time(start)
+                self.timeline_slider.setValue(int(start * 1000))
+            else:
+                # Проверяем, не достиг ли конец видео
+                length = self.player.get_length()
+                if length > 0 and current_time >= length - 0.1:
+                    # Если достигли конца, начинаем с начала
+                    start = self.preview_start_time if self.preview_start_time is not None else 0.0
+                    self.player.set_time(start)
+                    self.timeline_slider.setValue(int(start * 1000))
             
             self.player.play()
             self.play_pause_btn.setText("⏸ Пауза")
@@ -540,17 +561,38 @@ class MainWindow(QMainWindow):
             current_time = self.player.get_time()
             length = self.player.get_length()
             
+            # Если есть ограничение диапазона предпросмотра, проверяем его
+            if self.preview_end_time is not None and current_time >= self.preview_end_time:
+                self.player.stop()
+                self.play_pause_btn.setText("▶ Воспроизвести")
+                self.position_timer.stop()
+                # Устанавливаем слайдер на конец диапазона
+                if self.preview_end_time is not None:
+                    self.timeline_slider.setValue(int(self.preview_end_time * 1000))
+                return
+            
             if length > 0:
                 # Обновляем слайдер
                 self.timeline_slider.setValue(int(current_time * 1000))
                 
                 # Обновляем метку времени
                 current_str = seconds_to_timecode(current_time)
-                length_str = seconds_to_timecode(length)
-                self.time_label.setText(f"{current_str} / {length_str}")
+                
+                # Если есть ограничение диапазона, показываем его
+                if self.preview_start_time is not None and self.preview_end_time is not None:
+                    length_str = seconds_to_timecode(self.preview_end_time)
+                    # Показываем прогресс относительно диапазона
+                    range_str = f"{seconds_to_timecode(self.preview_start_time)} - {length_str}"
+                    self.time_label.setText(f"{current_str} / {range_str}")
+                else:
+                    length_str = seconds_to_timecode(length)
+                    self.time_label.setText(f"{current_str} / {length_str}")
             
-            # Проверяем, не достиг ли конец видео
-            if not self.player.is_playing() and current_time >= length - 0.1:
+            # Проверяем, не достиг ли конец видео (если нет ограничения диапазона)
+            if (self.preview_end_time is None and 
+                not self.player.is_playing() and 
+                length > 0 and 
+                current_time >= length - 0.1):
                 self.play_pause_btn.setText("▶ Воспроизвести")
                 self.position_timer.stop()
         except Exception as e:
@@ -572,14 +614,26 @@ class MainWindow(QMainWindow):
         position_ms = self.timeline_slider.value()
         position_seconds = position_ms / 1000.0
         
+        # Если есть ограничение диапазона предпросмотра, ограничиваем позицию
+        if self.preview_start_time is not None and position_seconds < self.preview_start_time:
+            position_seconds = self.preview_start_time
+            self.timeline_slider.setValue(int(position_seconds * 1000))
+        if self.preview_end_time is not None and position_seconds > self.preview_end_time:
+            position_seconds = self.preview_end_time
+            self.timeline_slider.setValue(int(position_seconds * 1000))
+        
         # Устанавливаем позицию в плеере
         was_playing = self.player.is_playing()
         self.player.set_time(position_seconds)
         
-        # Если было воспроизведение, продолжаем
+        # Если было воспроизведение, продолжаем (но только если не вышли за пределы диапазона)
         if was_playing:
-            self.player.play()  # Используем play() вместо resume() для надежности
-            self.play_pause_btn.setText("⏸ Пауза")
+            if (self.preview_end_time is None or position_seconds < self.preview_end_time):
+                self.player.play()  # Используем play() вместо resume() для надежности
+                self.play_pause_btn.setText("⏸ Пауза")
+            else:
+                self.player.stop()
+                self.play_pause_btn.setText("▶ Воспроизвести")
         else:
             self.play_pause_btn.setText("▶ Воспроизвести")
         
