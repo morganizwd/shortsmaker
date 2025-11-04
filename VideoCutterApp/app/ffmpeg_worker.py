@@ -181,14 +181,54 @@ class FFmpegWorker:
         # Это важно при использовании фильтров скорости, чтобы избежать проблем с ключевыми кадрами
         cmd.extend(["-i", str(input_file)])
         cmd.extend(["-ss", str(start_time)])
-        cmd.extend(["-t", str(input_duration)])
+        
+        # ВАЖНО: Всегда используем -t для ограничения входного потока
+        # Это предотвращает обработку всего файла после -ss
+        # При скорости != 1.0 используем -t с небольшим запасом, точная обрезка через trim
+        if abs(speed - 1.0) >= 0.01:
+            # С изменением скорости - используем -t с запасом (trim сделает точную обрезку)
+            cmd.extend(["-t", str(input_duration + 0.5)])  # Небольшой запас для безопасности
+        else:
+            # Без изменения скорости - используем стандартную обрезку через -t
+            cmd.extend(["-t", str(input_duration)])
+        
         # Добавляем параметры для корректной обработки временных меток
         cmd.extend(["-avoid_negative_ts", "make_zero"])
         cmd.extend(["-async", "1"])  # Синхронизация аудио и видео
         
+        # ВАЖНО: При использовании скорости с trim, используем -shortest
+        # чтобы остановить на самом коротком потоке (аудио или видео после обрезки и ускорения)
+        if abs(speed - 1.0) >= 0.01:
+            cmd.extend(["-shortest"])
+        
         # Построение фильтров
         video_filters_list = []
         audio_filters_list = []
+        
+        # КРИТИЧЕСКИ ВАЖНО: Порядок фильтров имеет значение!
+        # 1. Сначала применяем trim для точной обрезки по исходному времени (ДО изменения скорости)
+        #    Поскольку -ss уже применен, trim начинается с 0
+        # 2. setpts=PTS-STARTPTS сбрасывает временные метки после trim (начинает с 0)
+        # 3. Затем применяем setpts=PTS/speed для изменения скорости
+        # 4. Затем применяем другие фильтры (aspect ratio и т.д.)
+        
+        if abs(speed - 1.0) >= 0.01:
+            # Если применяется скорость, используем trim для точной обрезки
+            # trim обрезает по времени исходного видео (до применения setpts)
+            # Поскольку -ss уже применен, trim начинается с 0
+            # setpts=PTS-STARTPTS сбрасывает временные метки после trim (начинает с 0)
+            # Затем сразу применяем setpts=PTS/speed для изменения скорости
+            # Важно: объединяем все в правильном порядке
+            video_filters_list.append(f"trim=start=0:duration={input_duration},setpts=PTS-STARTPTS")
+            
+            # Затем применяем setpts для изменения скорости (отдельным фильтром)
+            speed_video_filters, speed_audio_filters = self._build_speed_filters(speed)
+            video_filters_list.extend(speed_video_filters)
+            
+            # Для аудио также применяем atrim для точной обрезки
+            # Затем atempo для изменения скорости
+            audio_filters_list.append(f"atrim=start=0:duration={input_duration},asetpts=PTS-STARTPTS")
+            audio_filters_list.extend(speed_audio_filters)
         
         # Применяем фильтры соотношения сторон (если нужно)
         # Проверяем, нужно ли изменять соотношение сторон
@@ -205,12 +245,6 @@ class FFmpegWorker:
             if abs(current_aspect - target_aspect) >= 0.01:
                 aspect_filters = self._build_aspect_ratio_filters(aspect_ratio, input_width, input_height)
                 video_filters_list.extend(aspect_filters)
-        
-        # Применяем фильтры скорости (если скорость != 1.0)
-        if abs(speed - 1.0) >= 0.01:
-            speed_video_filters, speed_audio_filters = self._build_speed_filters(speed)
-            video_filters_list.extend(speed_video_filters)
-            audio_filters_list.extend(speed_audio_filters)
         
         # Добавление пользовательских фильтров
         if filters:
