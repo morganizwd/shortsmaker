@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QLineEdit, QProgressBar, QTextEdit, QMessageBox,
-    QGroupBox, QSpinBox, QDoubleSpinBox, QComboBox
+    QGroupBox, QSpinBox, QDoubleSpinBox, QComboBox, QSplitter, QSlider
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QIcon
@@ -82,7 +82,8 @@ class MainWindow(QMainWindow):
         self.current_job: Job = None
         self.processing_thread: ProcessingThread = None
         self.video_info = None
-        self.player = VLCPlayer()
+        self.video_widget = None  # Будет создан в init_ui
+        self.player = None  # Будет создан после video_widget
         
         self.init_ui()
         self.setup_connections()
@@ -100,8 +101,65 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Главный layout
-        main_layout = QVBoxLayout(central_widget)
+        # Главный layout с разделителем (splitter)
+        main_layout = QHBoxLayout(central_widget)
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Левая панель: элементы управления
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # Правая панель: предпросмотр видео
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        # Виджет для видео с элементами управления
+        video_group = QGroupBox("Предпросмотр видео")
+        video_layout = QVBoxLayout()
+        
+        # Виджет для видео
+        self.video_widget = QWidget()
+        self.video_widget.setMinimumSize(640, 360)
+        self.video_widget.setStyleSheet("background-color: black;")
+        video_layout.addWidget(self.video_widget)
+        
+        # Элементы управления воспроизведением
+        controls_layout = QVBoxLayout()
+        
+        # Таймлайн (слайдер)
+        timeline_layout = QHBoxLayout()
+        self.time_label = QLabel("00:00:00.000 / 00:00:00.000")
+        self.timeline_slider = QSlider(Qt.Horizontal)
+        self.timeline_slider.setMinimum(0)
+        self.timeline_slider.setMaximum(1000)
+        self.timeline_slider.setValue(0)
+        self.timeline_slider.setEnabled(False)
+        timeline_layout.addWidget(self.time_label)
+        timeline_layout.addWidget(self.timeline_slider)
+        controls_layout.addLayout(timeline_layout)
+        
+        # Кнопки управления
+        buttons_controls_layout = QHBoxLayout()
+        self.play_pause_btn = QPushButton("▶ Воспроизвести")
+        self.stop_btn_player = QPushButton("⏹ Остановить")
+        buttons_controls_layout.addWidget(self.play_pause_btn)
+        buttons_controls_layout.addWidget(self.stop_btn_player)
+        buttons_controls_layout.addStretch()
+        controls_layout.addLayout(buttons_controls_layout)
+        
+        video_layout.addLayout(controls_layout)
+        video_group.setLayout(video_layout)
+        
+        right_layout.addWidget(video_group)
+        right_panel.setLayout(right_layout)
+        
+        # Таймер для обновления позиции слайдера
+        self.position_timer = QTimer()
+        self.position_timer.timeout.connect(self.update_video_position)
+        self.is_seeking = False  # Флаг для предотвращения конфликтов при перемотке
+        
+        # Инициализация плеера (будет настроен после показа окна)
+        self.player = None
         
         # Группа выбора файла
         file_group = QGroupBox("Выбор видео файла")
@@ -187,16 +245,38 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
         
-        # Добавление в главный layout
-        main_layout.addWidget(file_group)
-        main_layout.addWidget(time_group)
-        main_layout.addWidget(output_group)
-        main_layout.addWidget(encoding_group)
-        main_layout.addWidget(self.progress_label)
-        main_layout.addWidget(self.progress_bar)
-        main_layout.addLayout(buttons_layout)
-        main_layout.addWidget(QLabel("Лог:"))
-        main_layout.addWidget(self.log_text)
+        # Добавление в левую панель
+        left_layout.addWidget(file_group)
+        left_layout.addWidget(time_group)
+        left_layout.addWidget(output_group)
+        left_layout.addWidget(encoding_group)
+        left_layout.addWidget(self.progress_label)
+        left_layout.addWidget(self.progress_bar)
+        left_layout.addLayout(buttons_layout)
+        left_layout.addWidget(QLabel("Лог:"))
+        left_layout.addWidget(self.log_text)
+        left_panel.setLayout(left_layout)
+        
+        # Добавление панелей в splitter
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)  # Левая панель может изменяться
+        splitter.setStretchFactor(1, 2)  # Правая панель (видео) занимает больше места
+        
+        # Добавление splitter в главный layout
+        main_layout.addWidget(splitter)
+        
+        # Инициализация плеера после создания виджета
+        # Используем single-shot timer, чтобы убедиться, что виджет виден
+        QTimer.singleShot(100, self._init_player)
+    
+    def _init_player(self):
+        """Инициализирует VLC плеер после того, как виджет будет виден."""
+        if self.video_widget is not None:
+            self.player = VLCPlayer(self.video_widget)
+            # Убеждаемся, что виджет правильно настроен
+            if self.player:
+                self.player.set_video_widget(self.video_widget)
     
     def setup_connections(self):
         """Настройка сигналов и слотов."""
@@ -207,6 +287,13 @@ class MainWindow(QMainWindow):
         self.preview_btn.clicked.connect(self.preview_video)
         self.process_btn.clicked.connect(self.process_video)
         self.stop_btn.clicked.connect(self.stop_processing)
+        
+        # Элементы управления видео
+        self.play_pause_btn.clicked.connect(self.toggle_play_pause)
+        self.stop_btn_player.clicked.connect(self.stop_video_playback)
+        self.timeline_slider.sliderPressed.connect(self.on_slider_pressed)
+        self.timeline_slider.sliderReleased.connect(self.on_slider_released)
+        self.timeline_slider.valueChanged.connect(self.on_slider_value_changed)
     
     def log(self, message: str):
         """Добавляет сообщение в лог."""
@@ -237,8 +324,35 @@ class MainWindow(QMainWindow):
             self.end_time_edit.setText(seconds_to_timecode(duration))
             self.log(f"Загружено видео: длительность {seconds_to_timecode(duration)}, "
                     f"FPS: {self.video_info.get('fps', 0):.2f}")
+            
+            # Автоматически загружаем видео для предпросмотра
+            if self.player and self.video_widget:
+                # Небольшая задержка, чтобы убедиться, что виджет готов
+                QTimer.singleShot(200, lambda: self._auto_preview(video_path, duration))
         else:
             QMessageBox.warning(self, "Ошибка", "Не удалось загрузить информацию о видео")
+    
+    def _auto_preview(self, video_path: Path, duration: float):
+        """Автоматический предпросмотр видео при загрузке."""
+        if self.player and self.video_widget:
+            # Загружаем видео без ограничения по времени
+            self.player.play_file(video_path, 0.0, 0.0)  # 0.0 означает до конца
+            # Настраиваем слайдер
+            self.timeline_slider.setMaximum(int(duration * 1000))  # в миллисекундах
+            self.timeline_slider.setEnabled(True)
+            # Обновляем метку времени
+            length_str = seconds_to_timecode(duration)
+            self.time_label.setText(f"00:00:00.000 / {length_str}")
+            # Автоматически ставим на паузу после загрузки
+            QTimer.singleShot(500, lambda: self._pause_after_load())
+    
+    def _pause_after_load(self):
+        """Ставит видео на паузу после загрузки."""
+        if self.player:
+            self.player.pause()
+            self.play_pause_btn.setText("▶ Воспроизвести")
+            # Начинаем обновление позиции только после паузы
+            self.position_timer.start(100)
     
     def auto_set_output_path(self, input_path: str):
         """Автоматически устанавливает путь выходного файла."""
@@ -263,18 +377,22 @@ class MainWindow(QMainWindow):
     
     def set_start_time(self):
         """Устанавливает время начала из текущей позиции плеера."""
-        if self.player.is_playing():
+        if self.player and self.player.is_playing():
             current_time = self.player.get_time()
             self.start_time_edit.setText(seconds_to_timecode(current_time))
     
     def set_end_time(self):
         """Устанавливает время окончания из текущей позиции плеера."""
-        if self.player.is_playing():
+        if self.player and self.player.is_playing():
             current_time = self.player.get_time()
             self.end_time_edit.setText(seconds_to_timecode(current_time))
     
     def preview_video(self):
         """Предпросмотр видео."""
+        if not self.player:
+            QMessageBox.warning(self, "Ошибка", "Плеер не инициализирован")
+            return
+        
         input_path = self.input_file_edit.text()
         if not input_path or not Path(input_path).exists():
             QMessageBox.warning(self, "Ошибка", "Выберите входной файл")
@@ -294,8 +412,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Время начала должно быть меньше времени окончания")
             return
         
-        self.player.play_file(Path(input_path), start_time, end_time)
-        self.log(f"Предпросмотр: {start_time_str} - {end_time_str}")
+        # Загружаем видео полностью, но начинаем с указанного времени
+        self.player.play_file(Path(input_path), start_time, 0.0)  # 0.0 = до конца
+        # Настраиваем слайдер для предпросмотра
+        if self.video_info:
+            duration = self.video_info.get("duration", 0)
+            self.timeline_slider.setMaximum(int(duration * 1000))
+        self.timeline_slider.setEnabled(True)
+        self.position_timer.start(100)
+        self.log(f"Предпросмотр с началом: {start_time_str} - {end_time_str}")
     
     def process_video(self):
         """Обработка видео."""
@@ -371,4 +496,111 @@ class MainWindow(QMainWindow):
             self.current_job.status = "cancelled"
             self.log("Обработка остановлена пользователем")
             self.on_processing_finished(False, "Обработка остановлена")
+    
+    def toggle_play_pause(self):
+        """Переключение между воспроизведением и паузой."""
+        if not self.player:
+            return
+        
+        if self.player.is_playing():
+            self.player.pause()
+            self.play_pause_btn.setText("▶ Воспроизвести")
+            # Не останавливаем таймер, чтобы позиция продолжала обновляться
+        else:
+            # Проверяем, не достиг ли конец видео
+            current_time = self.player.get_time()
+            length = self.player.get_length()
+            if length > 0 and current_time >= length - 0.1:
+                # Если достигли конца, начинаем с начала
+                self.player.set_time(0.0)
+                self.timeline_slider.setValue(0)
+            
+            self.player.play()
+            self.play_pause_btn.setText("⏸ Пауза")
+            if not self.position_timer.isActive():
+                self.position_timer.start(100)
+    
+    def stop_video_playback(self):
+        """Остановка воспроизведения видео."""
+        if not self.player:
+            return
+        
+        self.player.stop()
+        self.play_pause_btn.setText("▶ Воспроизвести")
+        self.position_timer.stop()
+        self.timeline_slider.setValue(0)
+        self.time_label.setText("00:00:00.000 / " + self.time_label.text().split(" / ")[-1])
+    
+    def update_video_position(self):
+        """Обновление позиции слайдера во время воспроизведения."""
+        if not self.player or self.is_seeking:
+            return
+        
+        try:
+            current_time = self.player.get_time()
+            length = self.player.get_length()
+            
+            if length > 0:
+                # Обновляем слайдер
+                self.timeline_slider.setValue(int(current_time * 1000))
+                
+                # Обновляем метку времени
+                current_str = seconds_to_timecode(current_time)
+                length_str = seconds_to_timecode(length)
+                self.time_label.setText(f"{current_str} / {length_str}")
+            
+            # Проверяем, не достиг ли конец видео
+            if not self.player.is_playing() and current_time >= length - 0.1:
+                self.play_pause_btn.setText("▶ Воспроизвести")
+                self.position_timer.stop()
+        except Exception as e:
+            logger.error(f"Ошибка обновления позиции: {e}")
+    
+    def on_slider_pressed(self):
+        """Обработчик нажатия на слайдер."""
+        self.is_seeking = True
+        if self.player and self.player.is_playing():
+            self.player.pause()
+    
+    def on_slider_released(self):
+        """Обработчик отпускания слайдера."""
+        if not self.player:
+            self.is_seeking = False
+            return
+        
+        # Получаем позицию из слайдера
+        position_ms = self.timeline_slider.value()
+        position_seconds = position_ms / 1000.0
+        
+        # Устанавливаем позицию в плеере
+        was_playing = self.player.is_playing()
+        self.player.set_time(position_seconds)
+        
+        # Если было воспроизведение, продолжаем
+        if was_playing:
+            self.player.play()  # Используем play() вместо resume() для надежности
+            self.play_pause_btn.setText("⏸ Пауза")
+        else:
+            self.play_pause_btn.setText("▶ Воспроизвести")
+        
+        self.is_seeking = False
+    
+    def on_slider_value_changed(self, value):
+        """Обработчик изменения значения слайдера."""
+        if not self.player or not self.is_seeking:
+            return
+        
+        # Обновляем метку времени во время перемотки
+        position_seconds = value / 1000.0
+        current_str = seconds_to_timecode(position_seconds)
+        
+        if self.video_info:
+            duration = self.video_info.get("duration", 0)
+            length_str = seconds_to_timecode(duration)
+            self.time_label.setText(f"{current_str} / {length_str}")
+        else:
+            length = self.player.get_length()
+            if length > 0:
+                length_str = seconds_to_timecode(length)
+                self.time_label.setText(f"{current_str} / {length_str}")
 
