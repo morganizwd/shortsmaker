@@ -80,6 +80,7 @@ class Job:
     output_file: Path
     start_time: float = 0.0
     end_time: float = 0.0
+    speed: float = 1.0  # Скорость воспроизведения (0.5-3.0)
     filter_chain: FilterChain = field(default_factory=FilterChain)
     overlays: List[Overlay] = field(default_factory=list)
     subtitle_spec: Optional[SubtitleSpec] = None

@@ -55,7 +55,8 @@ class ProcessingThread(QThread):
                 self.job.start_time,
                 self.job.end_time,
                 filters if filters else None,
-                self.job.encoding_profile
+                self.job.encoding_profile,
+                self.job.speed
             )
             
             if success:
@@ -148,6 +149,22 @@ class MainWindow(QMainWindow):
         buttons_controls_layout.addWidget(self.stop_btn_player)
         buttons_controls_layout.addStretch()
         controls_layout.addLayout(buttons_controls_layout)
+        
+        # Слайдер скорости воспроизведения
+        speed_layout = QHBoxLayout()
+        speed_label = QLabel("Скорость:")
+        self.speed_value_label = QLabel("1.0x")
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setMinimum(5)  # 0.5x
+        self.speed_slider.setMaximum(30)  # 3.0x
+        self.speed_slider.setValue(10)  # 1.0x (нормальная скорость)
+        self.speed_slider.setTickPosition(QSlider.TicksBelow)
+        self.speed_slider.setTickInterval(5)
+        self.speed_slider.setSingleStep(1)
+        speed_layout.addWidget(speed_label)
+        speed_layout.addWidget(self.speed_slider)
+        speed_layout.addWidget(self.speed_value_label)
+        controls_layout.addLayout(speed_layout)
         
         video_layout.addLayout(controls_layout)
         video_group.setLayout(video_layout)
@@ -296,6 +313,7 @@ class MainWindow(QMainWindow):
         self.timeline_slider.sliderPressed.connect(self.on_slider_pressed)
         self.timeline_slider.sliderReleased.connect(self.on_slider_released)
         self.timeline_slider.valueChanged.connect(self.on_slider_value_changed)
+        self.speed_slider.valueChanged.connect(self.on_speed_changed)
     
     def log(self, message: str):
         """Добавляет сообщение в лог."""
@@ -340,6 +358,11 @@ class MainWindow(QMainWindow):
             # Сбрасываем ограничения диапазона при автоматической загрузке
             self.preview_start_time = None
             self.preview_end_time = None
+            
+            # Сбрасываем скорость на нормальную
+            self.speed_slider.setValue(10)  # 1.0x
+            if self.player:
+                self.player.set_rate(1.0)
             
             # Загружаем видео без ограничения по времени
             self.player.play_file(video_path, 0.0, 0.0)  # 0.0 означает до конца
@@ -454,12 +477,17 @@ class MainWindow(QMainWindow):
         start_time = timecode_to_seconds(start_time_str)
         end_time = timecode_to_seconds(end_time_str)
         
+        # Получаем текущую скорость из слайдера
+        speed_value = self.speed_slider.value()
+        speed = speed_value / 10.0  # Конвертируем из значения слайдера (5-30) в скорость (0.5-3.0)
+        
         # Создание задачи
         job = Job(
             input_file=Path(input_path),
             output_file=Path(output_path),
             start_time=start_time,
             end_time=end_time,
+            speed=speed,
             encoding_profile=ENCODING_PROFILES[self.encoding_profile_combo.currentText()]
         )
         
@@ -657,4 +685,15 @@ class MainWindow(QMainWindow):
             if length > 0:
                 length_str = seconds_to_timecode(length)
                 self.time_label.setText(f"{current_str} / {length_str}")
+    
+    def on_speed_changed(self, value: int):
+        """Обработчик изменения скорости воспроизведения."""
+        # Конвертируем значение слайдера (5-30) в скорость (0.5-3.0)
+        # 5 = 0.5x, 10 = 1.0x, 15 = 1.5x, 20 = 2.0x, 25 = 2.5x, 30 = 3.0x
+        speed = value / 10.0
+        self.speed_value_label.setText(f"{speed:.1f}x")
+        
+        # Устанавливаем скорость в плеере
+        if self.player:
+            self.player.set_rate(speed)
 

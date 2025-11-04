@@ -6,7 +6,7 @@ import subprocess
 import re
 import threading
 from pathlib import Path
-from typing import Optional, Callable, Dict, List
+from typing import Optional, Callable, Dict, List, Tuple
 from app.config import FFMPEG_EXE
 from app.utils.paths import find_ffmpeg
 from app.utils.logger import get_logger
@@ -63,6 +63,49 @@ class FFmpegWorker:
             }
         return None
     
+    def _build_speed_filters(self, speed: float) -> Tuple[List[str], List[str]]:
+        """
+        Строит фильтры для изменения скорости.
+        
+        Args:
+            speed: Скорость воспроизведения
+        
+        Returns:
+            tuple: (видео фильтры, аудио фильтры)
+        """
+        video_filters = []
+        audio_filters = []
+        
+        if abs(speed - 1.0) < 0.01:  # Скорость близка к 1.0
+            return video_filters, audio_filters
+        
+        # Видео фильтр: setpts изменяет PTS (presentation timestamp)
+        # setpts=PTS/speed - ускоряет видео (чем больше speed, тем быстрее)
+        video_filters.append(f"setpts=PTS/{speed}")
+        
+        # Аудио фильтр: atempo работает в диапазоне 0.5-2.0
+        # Для значений вне диапазона нужно применять несколько раз
+        if speed >= 0.5 and speed <= 2.0:
+            audio_filters.append(f"atempo={speed}")
+        elif speed > 2.0:
+            # Для speed > 2.0: применяем atempo=2.0 несколько раз, затем оставшуюся часть
+            remaining = speed
+            while remaining > 2.0:
+                audio_filters.append("atempo=2.0")
+                remaining = remaining / 2.0
+            if remaining > 1.0:
+                audio_filters.append(f"atempo={remaining}")
+        elif speed < 0.5:
+            # Для speed < 0.5: применяем atempo=0.5 несколько раз, затем оставшуюся часть
+            remaining = speed
+            while remaining < 0.5:
+                audio_filters.append("atempo=0.5")
+                remaining = remaining / 0.5
+            if remaining < 1.0:
+                audio_filters.append(f"atempo={remaining}")
+        
+        return video_filters, audio_filters
+    
     def build_command(
         self,
         input_file: Path,
@@ -70,20 +113,48 @@ class FFmpegWorker:
         start_time: float,
         end_time: float,
         filters: List[str] = None,
-        encoding_profile: Dict[str, any] = None
+        encoding_profile: Dict[str, any] = None,
+        speed: float = 1.0
     ) -> List[str]:
         """Строит команду ffmpeg."""
+        # Вычисляем длительность исходного видео для обрезки
+        input_duration = end_time - start_time
+        
         cmd = [
             str(self.ffmpeg_path),
             "-y",  # Перезаписать выходной файл
-            "-i", str(input_file),
-            "-ss", str(start_time),
-            "-t", str(end_time - start_time),
         ]
         
-        # Добавление фильтров
+        # Используем -ss после -i для более точной обрезки
+        # Это важно при использовании фильтров скорости, чтобы избежать проблем с ключевыми кадрами
+        cmd.extend(["-i", str(input_file)])
+        cmd.extend(["-ss", str(start_time)])
+        cmd.extend(["-t", str(input_duration)])
+        # Добавляем параметры для корректной обработки временных меток
+        cmd.extend(["-avoid_negative_ts", "make_zero"])
+        cmd.extend(["-async", "1"])  # Синхронизация аудио и видео
+        
+        # Построение фильтров скорости
+        video_filters_list = []
+        audio_filters_list = []
+        
+        # Применяем фильтры скорости (если скорость != 1.0)
+        if abs(speed - 1.0) >= 0.01:
+            speed_video_filters, speed_audio_filters = self._build_speed_filters(speed)
+            video_filters_list.extend(speed_video_filters)
+            audio_filters_list.extend(speed_audio_filters)
+        
+        # Добавление пользовательских фильтров
         if filters:
-            cmd.extend(["-vf", ",".join(filters)])
+            video_filters_list.extend(filters)
+        
+        # Добавление видео фильтров
+        if video_filters_list:
+            cmd.extend(["-vf", ",".join(video_filters_list)])
+        
+        # Добавление аудио фильтров
+        if audio_filters_list:
+            cmd.extend(["-af", ",".join(audio_filters_list)])
         
         # Добавление параметров кодирования
         if encoding_profile:
@@ -103,7 +174,8 @@ class FFmpegWorker:
         start_time: float,
         end_time: float,
         filters: List[str] = None,
-        encoding_profile: Dict[str, any] = None
+        encoding_profile: Dict[str, any] = None,
+        speed: float = 1.0
     ) -> bool:
         """Выполняет команду ffmpeg."""
         if self.is_running:
@@ -111,7 +183,7 @@ class FFmpegWorker:
             return False
         
         cmd = self.build_command(
-            input_file, output_file, start_time, end_time, filters, encoding_profile
+            input_file, output_file, start_time, end_time, filters, encoding_profile, speed
         )
         
         logger.info(f"Запуск ffmpeg: {' '.join(cmd)}")

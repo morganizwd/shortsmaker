@@ -218,6 +218,25 @@ class VLCPlayer:
             return self.player.get_length() / 1000.0
         return 0.0
     
+    def set_rate(self, rate: float):
+        """
+        Устанавливает скорость воспроизведения.
+        
+        Args:
+            rate: Скорость воспроизведения (0.5 = 0.5x, 1.0 = нормальная, 2.0 = 2x)
+        """
+        if self.player:
+            # Ограничиваем диапазон от 0.5 до 3.0
+            rate = max(0.5, min(3.0, rate))
+            self.player.set_rate(rate)
+            logger.info(f"Скорость воспроизведения установлена: {rate}x")
+    
+    def get_rate(self) -> float:
+        """Получает текущую скорость воспроизведения."""
+        if self.player:
+            return self.player.get_rate()
+        return 1.0
+    
     def release(self):
         """Освобождает ресурсы."""
         if self.player:
