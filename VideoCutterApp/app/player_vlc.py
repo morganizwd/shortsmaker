@@ -30,9 +30,18 @@ class VLCPlayer:
         self.video_widget = video_widget
         self.end_timer = QTimer()
         self.end_timer.timeout.connect(self._check_end_time)
+        self.aspect_ratio: Optional[str] = None
+        self.video_width: int = 1920
+        self.video_height: int = 1080
         
         try:
-            self.instance = vlc.Instance()
+            # Создаем instance с опциями для поддержки фильтров
+            # Включаем поддержку видео фильтров
+            vlc_options = [
+                '--intf', 'dummy',  # Отключаем интерфейс
+                '--quiet',  # Тихий режим
+            ]
+            self.instance = vlc.Instance(vlc_options)
             self.player = self.instance.media_player_new()
             
             # Если передан виджет, встраиваем видео в него
@@ -96,6 +105,111 @@ class VLCPlayer:
         except Exception as e:
             logger.error(f"Ошибка установки виджета: {e}")
     
+    def set_aspect_ratio(self, aspect_ratio: str, video_width: int = 1920, video_height: int = 1080):
+        """
+        Устанавливает соотношение сторон для предпросмотра.
+        
+        Args:
+            aspect_ratio: Соотношение сторон ("16:9" или "9:16")
+            video_width: Ширина исходного видео
+            video_height: Высота исходного видео
+        """
+        self.aspect_ratio = aspect_ratio
+        self.video_width = video_width
+        self.video_height = video_height
+        
+        if not self.player:
+            return
+        
+        try:
+            # Вычисляем параметры обрезки
+            if aspect_ratio == "16:9":
+                target_aspect = 16 / 9
+            elif aspect_ratio == "9:16":
+                target_aspect = 9 / 16
+            else:
+                return  # Неизвестное соотношение
+            
+            current_aspect = video_width / video_height if video_height > 0 else 1.0
+            
+            # Если соотношения совпадают, не нужно ничего делать
+            if abs(current_aspect - target_aspect) < 0.01:
+                # Сбрасываем crop через установку aspect ratio
+                try:
+                    # Используем стандартный aspect ratio
+                    self.player.video_set_aspect_ratio(None)
+                except:
+                    pass
+                return
+            
+            # Вычисляем параметры обрезки
+            if current_aspect > target_aspect:
+                # Обрезаем по ширине
+                new_height = video_height
+                new_width = int(new_height * target_aspect)
+                x_offset = (video_width - new_width) // 2
+                # Используем формат crop для VLC: width:height:x:y
+                crop_geometry = f"{new_width}:{new_height}:{x_offset}:0"
+            else:
+                # Обрезаем по высоте
+                new_width = video_width
+                new_height = int(new_width / target_aspect)
+                y_offset = (video_height - new_height) // 2
+                crop_geometry = f"{new_width}:{new_height}:0:{y_offset}"
+            
+            # Применяем crop через VLC
+            # Пробуем использовать различные методы VLC для обрезки
+            crop_applied = False
+            
+            # Метод 1: video_set_crop_geometry (если доступен в python-vlc)
+            if hasattr(self.player, 'video_set_crop_geometry'):
+                try:
+                    self.player.video_set_crop_geometry(crop_geometry)
+                    crop_applied = True
+                    logger.info(f"Установлен crop через video_set_crop_geometry: {crop_geometry}")
+                except Exception as e:
+                    logger.debug(f"video_set_crop_geometry не работает: {e}")
+            
+            # Метод 2: video_set_crop (альтернативный метод)
+            if not crop_applied and hasattr(self.player, 'video_set_crop'):
+                try:
+                    self.player.video_set_crop(crop_geometry)
+                    crop_applied = True
+                    logger.info(f"Установлен crop через video_set_crop: {crop_geometry}")
+                except Exception as e:
+                    logger.debug(f"video_set_crop не работает: {e}")
+            
+            # Метод 3: Используем фильтры через опции media
+            if not crop_applied:
+                try:
+                    # Парсим crop_geometry
+                    parts = crop_geometry.split(':')
+                    if len(parts) == 4:
+                        crop_w, crop_h, crop_x, crop_y = parts
+                        # Создаем фильтр crop для VLC
+                        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+                        # Применяем через опции media
+                        if self.current_file:
+                            media = self.instance.media_new(str(self.current_file))
+                            media.add_option(f':video-filter={crop_filter}')
+                            self.player.set_media(media)
+                            crop_applied = True
+                            logger.info(f"Установлен crop через фильтры: {crop_filter}")
+                except Exception as e:
+                    logger.debug(f"Не удалось применить crop через фильтры: {e}")
+            
+            # Метод 4: Если ничего не сработало, используем aspect ratio (менее точно)
+            if not crop_applied:
+                try:
+                    aspect_str = f"{target_aspect:.6f}"
+                    self.player.video_set_aspect_ratio(aspect_str)
+                    logger.warning("Метод crop недоступен, используется aspect ratio (может оставить черные полосы)")
+                except Exception as e:
+                    logger.error(f"Не удалось установить соотношение сторон: {e}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка установки соотношения сторон: {e}")
+    
     def play_file(self, file_path: Path, start_time: float = 0.0, end_time: float = 0.0):
         """
         Воспроизводит файл с указанным временным диапазоном.
@@ -118,12 +232,98 @@ class VLCPlayer:
             self.start_time = start_time
             self.end_time = end_time
             
+            # Создаем media с фильтрами crop, если нужно
             media = self.instance.media_new(str(file_path))
+            
+            # Применяем соотношение сторон через фильтры crop
+            if self.aspect_ratio:
+                # Вычисляем параметры crop
+                if self.aspect_ratio == "16:9":
+                    target_aspect = 16 / 9
+                elif self.aspect_ratio == "9:16":
+                    target_aspect = 9 / 16
+                else:
+                    target_aspect = None
+                
+                if target_aspect:
+                    current_aspect = self.video_width / self.video_height if self.video_height > 0 else 1.0
+                    if abs(current_aspect - target_aspect) >= 0.01:
+                        # Вычисляем crop
+                        if current_aspect > target_aspect:
+                            new_height = self.video_height
+                            new_width = int(new_height * target_aspect)
+                            x_offset = (self.video_width - new_width) // 2
+                            y_offset = 0
+                        else:
+                            new_width = self.video_width
+                            new_height = int(new_width / target_aspect)
+                            x_offset = 0
+                            y_offset = (self.video_height - new_height) // 2
+                        
+                        # Добавляем фильтр к media
+                        # VLC использует синтаксис фильтров через опции
+                        # Пробуем разные форматы для фильтра crop
+                        crop_applied = False
+                        
+                        # Формат 1: через video-filter с синтаксисом VLC (crop без параметров, только размеры)
+                        try:
+                            # В VLC фильтр crop может иметь формат: crop=width:height или через другие опции
+                            # Попробуем использовать scale для масштабирования до нужного размера
+                            # и затем crop через методы плеера
+                            vlc_crop_filter = f"scale={new_width}:{new_height}"
+                            media.add_option(f':video-filter={vlc_crop_filter}')
+                            crop_applied = True
+                            logger.info(f"Добавлен фильтр scale (формат 1): {vlc_crop_filter}")
+                            # Сохраняем параметры для применения crop через методы
+                            self._pending_crop = (new_width, new_height, x_offset, y_offset)
+                        except Exception as e1:
+                            logger.debug(f"Формат 1 не сработал: {e1}")
+                        
+                        # Формат 2: через video-filter с синтаксисом crop (без параметров позиции)
+                        if not crop_applied:
+                            try:
+                                # VLC может использовать crop=width:height
+                                simple_crop = f"crop={new_width}:{new_height}"
+                                media.add_option(f':video-filter={simple_crop}')
+                                crop_applied = True
+                                logger.info(f"Добавлен фильтр crop (формат 2): {simple_crop}")
+                            except Exception as e2:
+                                logger.debug(f"Формат 2 не сработал: {e2}")
+                        
+                        # Сохраняем параметры для применения через методы плеера после загрузки
+                        if not crop_applied:
+                            self._pending_crop = (new_width, new_height, x_offset, y_offset)
+                            logger.info("Параметры crop сохранены для применения через методы плеера")
+            
             self.player.set_media(media)
             
             # Убеждаемся, что виджет установлен (если он был передан)
             if self.video_widget is not None:
                 self.set_video_widget(self.video_widget)
+            
+            # Применяем crop через методы плеера, если фильтры через опции не сработали
+            if hasattr(self, '_pending_crop'):
+                try:
+                    crop_w, crop_h, crop_x, crop_y = self._pending_crop
+                    # Пробуем применить crop через методы плеера после небольшой задержки
+                    QTimer.singleShot(100, lambda: self._apply_crop_after_play(crop_w, crop_h, crop_x, crop_y))
+                    delattr(self, '_pending_crop')
+                except Exception as e:
+                    logger.error(f"Ошибка применения crop: {e}")
+            
+            # Применяем aspect ratio, если фильтр crop не сработал
+            if hasattr(self, '_pending_aspect_ratio'):
+                try:
+                    # Используем небольшую задержку, чтобы media успел загрузиться
+                    QTimer.singleShot(200, lambda: self.player.video_set_aspect_ratio(self._pending_aspect_ratio) if self.player else None)
+                    delattr(self, '_pending_aspect_ratio')
+                except:
+                    pass
+            
+            # Применяем соотношение сторон через методы плеера (если установлено)
+            if self.aspect_ratio:
+                # Используем задержку для применения после начала воспроизведения
+                QTimer.singleShot(300, lambda: self.set_aspect_ratio(self.aspect_ratio, self.video_width, self.video_height) if self.aspect_ratio else None)
             
             # Установка времени начала
             if start_time > 0:
@@ -149,6 +349,74 @@ class VLCPlayer:
         self.end_time = end_time
         # Запускаем таймер, который будет проверять текущее время каждые 100мс
         self.end_timer.start(100)  # Проверка каждые 100 миллисекунд
+    
+    def _apply_crop_after_play(self, crop_w: int, crop_h: int, crop_x: int, crop_y: int):
+        """Применяет crop после начала воспроизведения."""
+        if not self.player:
+            return
+        
+        # Ждем, пока видео начнет воспроизводиться
+        max_attempts = 10
+        attempt = 0
+        
+        def try_apply_crop():
+            nonlocal attempt
+            attempt += 1
+            
+            if not self.player or attempt > max_attempts:
+                return
+            
+            # Проверяем, что видео загружено
+            if self.player.get_state() == vlc.State.Playing or self.player.get_state() == vlc.State.Paused:
+                try:
+                    # Пробуем разные методы для применения crop
+                    # Метод 1: через video_adjust (если доступен)
+                    if hasattr(self.player, 'video_set_crop_ratio'):
+                        try:
+                            # VLC использует формат "число:число" для crop
+                            crop_ratio = f"{crop_w}:{crop_h}"
+                            self.player.video_set_crop_ratio(crop_ratio)
+                            logger.info(f"Применен crop через video_set_crop_ratio: {crop_ratio}")
+                            return
+                        except Exception as e:
+                            logger.debug(f"video_set_crop_ratio не сработал: {e}")
+                    
+                    # Метод 2: через crop geometry
+                    crop_geometry = f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"
+                    if hasattr(self.player, 'video_set_crop_geometry'):
+                        try:
+                            self.player.video_set_crop_geometry(crop_geometry)
+                            logger.info(f"Применен crop через video_set_crop_geometry: {crop_geometry}")
+                            return
+                        except Exception as e:
+                            logger.debug(f"video_set_crop_geometry не сработал: {e}")
+                    
+                    # Метод 3: через video_set_crop
+                    if hasattr(self.player, 'video_set_crop'):
+                        try:
+                            self.player.video_set_crop(crop_geometry)
+                            logger.info(f"Применен crop через video_set_crop: {crop_geometry}")
+                            return
+                        except Exception as e:
+                            logger.debug(f"video_set_crop не сработал: {e}")
+                    
+                    # Метод 4: через масштабирование и обрезку через aspect ratio с zoom
+                    try:
+                        # Вычисляем масштаб для заполнения виджета
+                        widget_aspect = crop_w / crop_h if crop_h > 0 else 1.0
+                        aspect_str = f"{widget_aspect:.6f}"
+                        self.player.video_set_aspect_ratio(aspect_str)
+                        logger.info(f"Применен aspect ratio (временное решение): {aspect_str}")
+                    except Exception as e:
+                        logger.warning(f"Не удалось применить aspect ratio: {e}")
+                except Exception as e:
+                    logger.error(f"Ошибка применения crop: {e}")
+            else:
+                # Если видео еще не загружено, пробуем еще раз через 100мс
+                QTimer.singleShot(100, try_apply_crop)
+        
+        # Запускаем первую попытку
+        QTimer.singleShot(200, try_apply_crop)
     
     def _check_end_time(self):
         """Проверяет текущее время и останавливает воспроизведение при достижении end_time."""

@@ -81,6 +81,7 @@ class Job:
     start_time: float = 0.0
     end_time: float = 0.0
     speed: float = 1.0  # Скорость воспроизведения (0.5-3.0)
+    aspect_ratio: str = "16:9"  # Соотношение сторон: "16:9" или "9:16"
     filter_chain: FilterChain = field(default_factory=FilterChain)
     overlays: List[Overlay] = field(default_factory=list)
     subtitle_spec: Optional[SubtitleSpec] = None

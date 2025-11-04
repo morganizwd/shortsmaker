@@ -63,6 +63,55 @@ class FFmpegWorker:
             }
         return None
     
+    def _build_aspect_ratio_filters(self, aspect_ratio: str, input_width: int, input_height: int) -> List[str]:
+        """
+        Строит фильтры для изменения соотношения сторон с заполнением кадра.
+        
+        Args:
+            aspect_ratio: Соотношение сторон ("16:9" или "9:16")
+            input_width: Ширина исходного видео
+            input_height: Высота исходного видео
+        
+        Returns:
+            Список видео фильтров
+        """
+        filters = []
+        
+        if aspect_ratio == "16:9":
+            target_aspect = 16 / 9
+        elif aspect_ratio == "9:16":
+            target_aspect = 9 / 16
+        else:
+            return filters  # Неизвестное соотношение
+        
+        # Вычисляем текущее соотношение сторон исходного видео
+        current_aspect = input_width / input_height if input_height > 0 else 1.0
+        
+        # Если соотношения совпадают, не нужно ничего делать
+        if abs(current_aspect - target_aspect) < 0.01:
+            return filters
+        
+        # Вычисляем размеры для целевого соотношения сторон
+        # Стратегия: обрезаем так, чтобы заполнить кадр без черных полос
+        if current_aspect > target_aspect:
+            # Исходное видео шире целевого - обрезаем по ширине
+            # Высота остается исходной, вычисляем новую ширину
+            new_height = input_height
+            new_width = int(new_height * target_aspect)
+            # Обрезаем по центру по ширине
+            x_offset = (input_width - new_width) // 2
+            filters.append(f"crop={new_width}:{new_height}:{x_offset}:0")
+        else:
+            # Исходное видео уже целевого - обрезаем по высоте
+            # Ширина остается исходной, вычисляем новую высоту
+            new_width = input_width
+            new_height = int(new_width / target_aspect)
+            # Обрезаем по центру по высоте
+            y_offset = (input_height - new_height) // 2
+            filters.append(f"crop={new_width}:{new_height}:0:{y_offset}")
+        
+        return filters
+    
     def _build_speed_filters(self, speed: float) -> Tuple[List[str], List[str]]:
         """
         Строит фильтры для изменения скорости.
@@ -114,7 +163,10 @@ class FFmpegWorker:
         end_time: float,
         filters: List[str] = None,
         encoding_profile: Dict[str, any] = None,
-        speed: float = 1.0
+        speed: float = 1.0,
+        aspect_ratio: str = "16:9",
+        input_width: int = 1920,
+        input_height: int = 1080
     ) -> List[str]:
         """Строит команду ffmpeg."""
         # Вычисляем длительность исходного видео для обрезки
@@ -134,9 +186,25 @@ class FFmpegWorker:
         cmd.extend(["-avoid_negative_ts", "make_zero"])
         cmd.extend(["-async", "1"])  # Синхронизация аудио и видео
         
-        # Построение фильтров скорости
+        # Построение фильтров
         video_filters_list = []
         audio_filters_list = []
+        
+        # Применяем фильтры соотношения сторон (если нужно)
+        # Проверяем, нужно ли изменять соотношение сторон
+        if aspect_ratio:
+            current_aspect = input_width / input_height if input_height > 0 else 1.0
+            if aspect_ratio == "16:9":
+                target_aspect = 16 / 9
+            elif aspect_ratio == "9:16":
+                target_aspect = 9 / 16
+            else:
+                target_aspect = current_aspect  # Неизвестное соотношение - не меняем
+            
+            # Применяем фильтры только если соотношения различаются
+            if abs(current_aspect - target_aspect) >= 0.01:
+                aspect_filters = self._build_aspect_ratio_filters(aspect_ratio, input_width, input_height)
+                video_filters_list.extend(aspect_filters)
         
         # Применяем фильтры скорости (если скорость != 1.0)
         if abs(speed - 1.0) >= 0.01:
@@ -175,7 +243,10 @@ class FFmpegWorker:
         end_time: float,
         filters: List[str] = None,
         encoding_profile: Dict[str, any] = None,
-        speed: float = 1.0
+        speed: float = 1.0,
+        aspect_ratio: str = "16:9",
+        input_width: int = 1920,
+        input_height: int = 1080
     ) -> bool:
         """Выполняет команду ffmpeg."""
         if self.is_running:
@@ -183,7 +254,8 @@ class FFmpegWorker:
             return False
         
         cmd = self.build_command(
-            input_file, output_file, start_time, end_time, filters, encoding_profile, speed
+            input_file, output_file, start_time, end_time, filters, encoding_profile, 
+            speed, aspect_ratio, input_width, input_height
         )
         
         logger.info(f"Запуск ffmpeg: {' '.join(cmd)}")

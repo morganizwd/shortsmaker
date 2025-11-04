@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QLabel, QLineEdit, QProgressBar, QTextEdit, QMessageBox,
     QGroupBox, QSpinBox, QDoubleSpinBox, QComboBox, QSplitter, QSlider
 )
+from PySide6.QtGui import QRegion
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QIcon
 from app.config import (
@@ -49,6 +50,11 @@ class ProcessingThread(QThread):
             self.job.status = "running"
             filters = self.job.get_all_filters()
             
+            # Получаем размеры исходного видео
+            video_info = get_video_info(self.job.input_file)
+            input_width = video_info.get("width", 1920) if video_info else 1920
+            input_height = video_info.get("height", 1080) if video_info else 1080
+            
             success = self.worker.execute(
                 self.job.input_file,
                 self.job.output_file,
@@ -56,7 +62,10 @@ class ProcessingThread(QThread):
                 self.job.end_time,
                 filters if filters else None,
                 self.job.encoding_profile,
-                self.job.speed
+                self.job.speed,
+                self.job.aspect_ratio,
+                input_width,
+                input_height
             )
             
             if success:
@@ -120,7 +129,8 @@ class MainWindow(QMainWindow):
         video_group = QGroupBox("Предпросмотр видео")
         video_layout = QVBoxLayout()
         
-        # Виджет для видео
+        # Виджет для видео с поддержкой масштабирования
+        # Используем QWidget для встраивания VLC
         self.video_widget = QWidget()
         self.video_widget.setMinimumSize(640, 360)
         self.video_widget.setStyleSheet("background-color: black;")
@@ -229,6 +239,20 @@ class MainWindow(QMainWindow):
         output_layout.addWidget(self.output_file_btn)
         output_group.setLayout(output_layout)
         
+        # Группа соотношения сторон
+        aspect_group = QGroupBox("Соотношение сторон")
+        aspect_layout = QHBoxLayout()
+        
+        self.aspect_ratio_combo = QComboBox()
+        self.aspect_ratio_combo.addItems(["16:9", "9:16"])
+        self.aspect_ratio_combo.setCurrentText("16:9")
+        self.aspect_ratio_combo.currentTextChanged.connect(self.on_aspect_ratio_changed)
+        
+        aspect_layout.addWidget(QLabel("Соотношение:"))
+        aspect_layout.addWidget(self.aspect_ratio_combo)
+        aspect_layout.addStretch()
+        aspect_group.setLayout(aspect_layout)
+        
         # Группа профиля кодирования
         encoding_group = QGroupBox("Профиль кодирования")
         encoding_layout = QHBoxLayout()
@@ -268,6 +292,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(file_group)
         left_layout.addWidget(time_group)
         left_layout.addWidget(output_group)
+        left_layout.addWidget(aspect_group)
         left_layout.addWidget(encoding_group)
         left_layout.addWidget(self.progress_label)
         left_layout.addWidget(self.progress_bar)
@@ -345,6 +370,9 @@ class MainWindow(QMainWindow):
             self.log(f"Загружено видео: длительность {seconds_to_timecode(duration)}, "
                     f"FPS: {self.video_info.get('fps', 0):.2f}")
             
+            # Обновляем размер виджета в соответствии с текущим соотношением сторон
+            self._update_video_widget_size()
+            
             # Автоматически загружаем видео для предпросмотра
             if self.player and self.video_widget:
                 # Небольшая задержка, чтобы убедиться, что виджет готов
@@ -363,6 +391,16 @@ class MainWindow(QMainWindow):
             self.speed_slider.setValue(10)  # 1.0x
             if self.player:
                 self.player.set_rate(1.0)
+            
+            # Применяем соотношение сторон в плеере
+            if self.video_info:
+                width = self.video_info.get("width", 1920)
+                height = self.video_info.get("height", 1080)
+                aspect_ratio = self.aspect_ratio_combo.currentText()
+                # Сохраняем размеры в плеере для использования в play_file
+                self.player.video_width = width
+                self.player.video_height = height
+                self.player.aspect_ratio = aspect_ratio
             
             # Загружаем видео без ограничения по времени
             self.player.play_file(video_path, 0.0, 0.0)  # 0.0 означает до конца
@@ -445,6 +483,16 @@ class MainWindow(QMainWindow):
         self.preview_start_time = start_time
         self.preview_end_time = end_time
         
+        # Применяем соотношение сторон в плеере перед воспроизведением
+        if self.video_info:
+            width = self.video_info.get("width", 1920)
+            height = self.video_info.get("height", 1080)
+            aspect_ratio = self.aspect_ratio_combo.currentText()
+            # Сохраняем размеры в плеере для использования в play_file
+            self.player.video_width = width
+            self.player.video_height = height
+            self.player.aspect_ratio = aspect_ratio
+        
         # Загружаем видео с указанным диапазоном
         self.player.play_file(Path(input_path), start_time, end_time)
         # Настраиваем слайдер для предпросмотра
@@ -481,6 +529,9 @@ class MainWindow(QMainWindow):
         speed_value = self.speed_slider.value()
         speed = speed_value / 10.0  # Конвертируем из значения слайдера (5-30) в скорость (0.5-3.0)
         
+        # Получаем соотношение сторон
+        aspect_ratio = self.aspect_ratio_combo.currentText()
+        
         # Создание задачи
         job = Job(
             input_file=Path(input_path),
@@ -488,6 +539,7 @@ class MainWindow(QMainWindow):
             start_time=start_time,
             end_time=end_time,
             speed=speed,
+            aspect_ratio=aspect_ratio,
             encoding_profile=ENCODING_PROFILES[self.encoding_profile_combo.currentText()]
         )
         
@@ -696,4 +748,52 @@ class MainWindow(QMainWindow):
         # Устанавливаем скорость в плеере
         if self.player:
             self.player.set_rate(speed)
+    
+    def on_aspect_ratio_changed(self, aspect_ratio: str):
+        """Обработчик изменения соотношения сторон."""
+        # Обновляем размер виджета видео для предпросмотра
+        self._update_video_widget_size(aspect_ratio)
+        
+        # Применяем соотношение сторон в плеере для предпросмотра
+        if self.player and self.video_info:
+            width = self.video_info.get("width", 1920)
+            height = self.video_info.get("height", 1080)
+            # Сохраняем размеры и соотношение сторон в плеере
+            self.player.video_width = width
+            self.player.video_height = height
+            self.player.aspect_ratio = aspect_ratio
+            
+            # Если видео уже воспроизводится, перезагружаем его с новыми фильтрами
+            if self.player.current_file and self.player.current_file.exists():
+                was_playing = self.player.is_playing()
+                current_time = self.player.get_time()
+                self.player.play_file(self.player.current_file, current_time, 0.0)
+                if not was_playing:
+                    self.player.pause()
+    
+    def _update_video_widget_size(self, aspect_ratio: str = None):
+        """Обновляет размер виджета видео в соответствии с соотношением сторон."""
+        if not self.video_widget:
+            return
+        
+        if aspect_ratio is None:
+            aspect_ratio = self.aspect_ratio_combo.currentText()
+        
+        # Используем фиксированные размеры для предпросмотра
+        # Виджет будет масштабировать видео для заполнения
+        if aspect_ratio == "9:16":
+            # Вертикальное видео - используем вертикальный виджет
+            new_width = 360  # Уже для вертикального видео
+            new_height = 640  # Высота для вертикального видео
+        else:  # 16:9
+            # Горизонтальное видео
+            new_width = 640
+            new_height = 360
+        
+        self.video_widget.setMinimumSize(new_width, new_height)
+        self.video_widget.setMaximumSize(new_width, new_height)
+        # Устанавливаем стиль для масштабирования содержимого
+        self.video_widget.setStyleSheet("background-color: black;")
+        # Обновляем виджет, чтобы применить изменения
+        self.video_widget.update()
 
