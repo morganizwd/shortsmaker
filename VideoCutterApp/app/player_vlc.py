@@ -34,6 +34,16 @@ class VLCPlayer:
         self.video_width: int = 1920
         self.video_height: int = 1080
         
+        # Параметры цветокоррекции для предпросмотра
+        self.brightness: float = 0.0
+        self.contrast: float = 1.0
+        self.saturation: float = 1.0
+        self.hue: float = 0.0  # Используется для тона (tint)
+        self.gamma: float = 1.0  # Используется для теней (shadows)
+        self.sharpness: float = 0.0
+        self.temperature: float = 0.0
+        self.tint: float = 0.0
+        
         try:
             # Создаем instance с опциями для поддержки фильтров
             # Включаем поддержку видео фильтров
@@ -504,6 +514,141 @@ class VLCPlayer:
         if self.player:
             return self.player.get_rate()
         return 1.0
+    
+    def set_color_correction(
+        self,
+        brightness: float = 0.0,
+        contrast: float = 1.0,
+        saturation: float = 1.0,
+        sharpness: float = 0.0,
+        shadows: float = 0.0,
+        temperature: float = 0.0,
+        tint: float = 0.0
+    ):
+        """
+        Применяет настройки цветокоррекции к предпросмотру.
+        
+        Args:
+            brightness: Яркость (-1.0 до 1.0)
+            contrast: Контрастность (0.0 до 2.0)
+            saturation: Насыщенность (0.0 до 2.0)
+            sharpness: Резкость (-1.0 до 1.0)
+            shadows: Тени (-1.0 до 1.0, преобразуется в gamma)
+            temperature: Температура (-100 до 100)
+            tint: Тон (-100 до 100)
+        """
+        if not self.player:
+            return
+        
+        # Сохраняем параметры
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.sharpness = sharpness
+        self.temperature = temperature
+        self.tint = tint
+        
+        # Преобразуем shadows в gamma для VLC
+        # shadows > 0 осветляет тени (gamma < 1.0), shadows < 0 затемняет (gamma > 1.0)
+        # VLC использует gamma от 0.01 до 10.0
+        if abs(shadows) >= 0.01:
+            self.gamma = max(0.01, min(10.0, 1.0 / (1.0 + shadows * 0.5)))
+        else:
+            self.gamma = 1.0
+        
+        try:
+            # VLC использует video_adjust для цветокоррекции
+            # Диапазоны значений в VLC:
+            # brightness: -1.0 до 1.0
+            # contrast: 0.0 до 2.0
+            # saturation: 0.0 до 3.0
+            # hue: -180.0 до 180.0 (используется для тона)
+            # gamma: 0.01 до 10.0
+            
+            # Применяем яркость
+            brightness_vlc = max(-1.0, min(1.0, brightness))
+            if hasattr(self.player, 'video_set_adjust_int') or hasattr(self.player, 'video_set_adjust_float'):
+                try:
+                    # VLC 3.x использует video_set_adjust_float
+                    if hasattr(self.player, 'video_set_adjust_float'):
+                        self.player.video_set_adjust_float(vlc.VideoAdjustOption.Enable, 1.0)
+                        self.player.video_set_adjust_float(vlc.VideoAdjustOption.Brightness, brightness_vlc)
+                    elif hasattr(self.player, 'video_set_adjust_int'):
+                        # VLC 2.x может использовать int
+                        self.player.video_set_adjust_int(vlc.VideoAdjustOption.Enable, 1)
+                        brightness_int = int(brightness_vlc * 100)
+                        self.player.video_set_adjust_int(vlc.VideoAdjustOption.Brightness, brightness_int)
+                except Exception as e:
+                    logger.debug(f"Не удалось установить brightness через video_adjust: {e}")
+            
+            # Применяем контрастность
+            contrast_vlc = max(0.0, min(2.0, contrast))
+            try:
+                if hasattr(self.player, 'video_set_adjust_float'):
+                    self.player.video_set_adjust_float(vlc.VideoAdjustOption.Contrast, contrast_vlc)
+                elif hasattr(self.player, 'video_set_adjust_int'):
+                    contrast_int = int(contrast_vlc * 100)
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Contrast, contrast_int)
+            except Exception as e:
+                logger.debug(f"Не удалось установить contrast: {e}")
+            
+            # Применяем насыщенность с учетом температуры
+            # Температура может влиять на насыщенность
+            saturation_vlc = max(0.0, min(3.0, saturation))
+            if abs(temperature) >= 0.01:
+                # Температура влияет на насыщенность
+                temp_factor = temperature / 100.0
+                saturation_vlc = saturation_vlc * (1.0 + temp_factor * 0.2)
+                saturation_vlc = max(0.0, min(3.0, saturation_vlc))
+            
+            try:
+                if hasattr(self.player, 'video_set_adjust_float'):
+                    self.player.video_set_adjust_float(vlc.VideoAdjustOption.Saturation, saturation_vlc)
+                elif hasattr(self.player, 'video_set_adjust_int'):
+                    saturation_int = int(saturation_vlc * 100)
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Saturation, saturation_int)
+            except Exception as e:
+                logger.debug(f"Не удалось установить saturation: {e}")
+            
+            # Применяем gamma (для теней)
+            gamma_vlc = max(0.01, min(10.0, self.gamma))
+            try:
+                if hasattr(self.player, 'video_set_adjust_float'):
+                    self.player.video_set_adjust_float(vlc.VideoAdjustOption.Gamma, gamma_vlc)
+                elif hasattr(self.player, 'video_set_adjust_int'):
+                    gamma_int = int(gamma_vlc * 100)
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Gamma, gamma_int)
+            except Exception as e:
+                logger.debug(f"Не удалось установить gamma: {e}")
+            
+            # Применяем тон (tint) через hue
+            # tint преобразуем в hue: -100 до 100 -> -180 до 180 градусов
+            hue_vlc = 0.0
+            if abs(tint) >= 0.01:
+                hue_vlc = max(-180.0, min(180.0, tint * 1.8))
+            
+            # Температура также влияет на hue (для более реалистичного эффекта)
+            if abs(temperature) >= 0.01:
+                temp_factor = temperature / 100.0
+                # Теплее сдвигает в сторону желтого (положительный hue), холоднее в сторону синего (отрицательный)
+                hue_vlc += temp_factor * 30.0  # Смещение hue для температуры
+                hue_vlc = max(-180.0, min(180.0, hue_vlc))
+            
+            if abs(hue_vlc) >= 0.01:
+                try:
+                    if hasattr(self.player, 'video_set_adjust_float'):
+                        self.player.video_set_adjust_float(vlc.VideoAdjustOption.Hue, hue_vlc)
+                    elif hasattr(self.player, 'video_set_adjust_int'):
+                        hue_int = int(hue_vlc)
+                        self.player.video_set_adjust_int(vlc.VideoAdjustOption.Hue, hue_int)
+                except Exception as e:
+                    logger.debug(f"Не удалось установить hue: {e}")
+            
+            logger.info(f"Применена цветокоррекция: brightness={brightness:.2f}, contrast={contrast:.2f}, "
+                       f"saturation={saturation:.2f}, shadows={shadows:.2f}, temperature={temperature}, tint={tint}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка применения цветокоррекции: {e}")
     
     def release(self):
         """Освобождает ресурсы."""

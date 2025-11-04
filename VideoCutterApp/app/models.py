@@ -82,6 +82,14 @@ class Job:
     end_time: float = 0.0
     speed: float = 1.0  # Скорость воспроизведения (0.5-3.0)
     aspect_ratio: str = "16:9"  # Соотношение сторон: "16:9" или "9:16"
+    # Настройки цветокоррекции
+    brightness: float = 0.0  # Яркость: -1.0 до 1.0
+    contrast: float = 1.0  # Контрастность: 0.0 до 2.0
+    saturation: float = 1.0  # Насыщенность: 0.0 до 2.0
+    sharpness: float = 0.0  # Резкость: -1.0 до 1.0
+    shadows: float = 0.0  # Тени: -1.0 до 1.0
+    temperature: float = 0.0  # Температура (цвет): -100 до 100
+    tint: float = 0.0  # Тон (оттенок): -100 до 100
     filter_chain: FilterChain = field(default_factory=FilterChain)
     overlays: List[Overlay] = field(default_factory=list)
     subtitle_spec: Optional[SubtitleSpec] = None

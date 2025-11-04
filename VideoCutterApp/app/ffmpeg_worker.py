@@ -112,6 +112,151 @@ class FFmpegWorker:
         
         return filters
     
+    def _build_color_filters(
+        self,
+        brightness: float = 0.0,
+        contrast: float = 1.0,
+        saturation: float = 1.0,
+        sharpness: float = 0.0,
+        shadows: float = 0.0,
+        temperature: float = 0.0,
+        tint: float = 0.0
+    ) -> List[str]:
+        """
+        Строит фильтры для цветокоррекции.
+        
+        Args:
+            brightness: Яркость (-1.0 до 1.0)
+            contrast: Контрастность (0.0 до 2.0)
+            saturation: Насыщенность (0.0 до 2.0)
+            sharpness: Резкость (-1.0 до 1.0)
+            shadows: Тени (-1.0 до 1.0)
+            temperature: Температура цвета (-100 до 100)
+            tint: Тон/оттенок (-100 до 100)
+        
+        Returns:
+            Список видео фильтров
+        """
+        filters = []
+        
+        # Собираем параметры для фильтра eq (brightness, contrast, saturation, gamma)
+        eq_params = []
+        
+        # Яркость (brightness) - применяем только если изменена
+        if abs(brightness) >= 0.01:
+            eq_params.append(f"brightness={brightness:.3f}")
+        
+        # Контрастность (contrast) - применяем только если изменена
+        if abs(contrast - 1.0) >= 0.01:
+            eq_params.append(f"contrast={contrast:.3f}")
+        
+        # Насыщенность (saturation) - применяем только если изменена
+        if abs(saturation - 1.0) >= 0.01:
+            eq_params.append(f"saturation={saturation:.3f}")
+        
+        # Тени (shadows) - используем gamma в том же фильтре eq
+        # shadows > 0 осветляет тени, shadows < 0 затемняет
+        if abs(shadows) >= 0.01:
+            # gamma > 1.0 осветляет тени, gamma < 1.0 затемняет
+            gamma = 1.0 + shadows * 0.5
+            eq_params.append(f"gamma={gamma:.3f}")
+        
+        # Применяем фильтр eq со всеми параметрами одновременно
+        if eq_params:
+            filters.append(f"eq={':'.join(eq_params)}")
+        
+        # Резкость (sharpness) - используем unsharp фильтр
+        if abs(sharpness) >= 0.01:
+            # Преобразуем sharpness (-1.0 до 1.0) в параметры unsharp
+            # Положительное значение = усиление резкости, отрицательное = размытие
+            if sharpness > 0:
+                # Усиление резкости: luma_msize_x=5:luma_msize_y=5:luma_amount=sharpness
+                # Используем более сильный эффект для заметности
+                amount = sharpness * 2.0  # Увеличиваем множитель для более заметного эффекта
+                filters.append(f"unsharp=5:5:{amount:.3f}")
+            else:
+                # Размытие: используем boxblur
+                blur = abs(sharpness) * 3.0  # Увеличиваем для более заметного эффекта
+                filters.append(f"boxblur={blur:.1f}:{blur:.1f}")
+        
+        # Температура цвета (temperature) и тон (tint)
+        # Используем colorchannelmixer для более точного контроля цветов
+        # colorchannelmixer позволяет точно настраивать смешивание цветовых каналов
+        
+        if abs(temperature) >= 0.01 or abs(tint) >= 0.01:
+            # Преобразуем temperature (-100 до 100) в параметры
+            # temperature > 0 = теплее (желтый), temperature < 0 = холоднее (синий)
+            temp_factor = temperature / 100.0
+            
+            # Преобразуем tint (-100 до 100) в параметры
+            # tint > 0 = зеленый, tint < 0 = пурпурный
+            tint_factor = tint / 100.0
+            
+            # Используем colorchannelmixer для коррекции цвета
+            # Формат: colorchannelmixer=rr:rg:rb:gr:gg:gb:br:bg:bb
+            # rr=red to red, rg=red to green, rb=red to blue, и т.д.
+            # Значения от 0 до 2, где 1.0 = без изменений
+            
+            # Начальные значения (без изменений)
+            rr = 1.0
+            rg = 0.0
+            rb = 0.0
+            gr = 0.0
+            gg = 1.0
+            gb = 0.0
+            br = 0.0
+            bg = 0.0
+            bb = 1.0
+            
+            # Коррекция температуры
+            # Температура > 0 (теплее): увеличиваем красный, уменьшаем синий
+            # Температура < 0 (холоднее): уменьшаем красный, увеличиваем синий
+            temp_strength = abs(temp_factor) * 0.3  # Сила эффекта (0.0 до 0.3)
+            temp_strength = max(0.0, min(0.3, temp_strength))
+            
+            if temp_factor > 0:
+                # Теплее: больше красного, меньше синего
+                rr = 1.0 + temp_strength
+                bb = 1.0 - temp_strength
+            elif temp_factor < 0:
+                # Холоднее: меньше красного, больше синего
+                rr = 1.0 - temp_strength
+                bb = 1.0 + temp_strength
+            
+            # Коррекция тона
+            # Тон > 0 (зеленый): увеличиваем зеленый
+            # Тон < 0 (пурпурный): уменьшаем зеленый, увеличиваем красный и синий
+            tint_strength = abs(tint_factor) * 0.3  # Сила эффекта (0.0 до 0.3)
+            tint_strength = max(0.0, min(0.3, tint_strength))
+            
+            if tint_factor > 0:
+                # Зеленый: больше зеленого
+                gg = 1.0 + tint_strength
+            elif tint_factor < 0:
+                # Пурпурный: меньше зеленого, больше красного и синего
+                gg = 1.0 - tint_strength
+                rr = max(1.0, rr + tint_strength * 0.5)  # Добавляем красный
+                bb = max(1.0, bb + tint_strength * 0.5)  # Добавляем синий
+            
+            # Ограничиваем все значения
+            rr = max(0.0, min(2.0, rr))
+            rg = max(0.0, min(2.0, rg))
+            rb = max(0.0, min(2.0, rb))
+            gr = max(0.0, min(2.0, gr))
+            gg = max(0.0, min(2.0, gg))
+            gb = max(0.0, min(2.0, gb))
+            br = max(0.0, min(2.0, br))
+            bg = max(0.0, min(2.0, bg))
+            bb = max(0.0, min(2.0, bb))
+            
+            # Применяем только если есть значимые изменения
+            if abs(temp_factor) >= 0.01 or abs(tint_factor) >= 0.01:
+                filter_str = f"colorchannelmixer=rr={rr:.3f}:rg={rg:.3f}:rb={rb:.3f}:gr={gr:.3f}:gg={gg:.3f}:gb={gb:.3f}:br={br:.3f}:bg={bg:.3f}:bb={bb:.3f}"
+                filters.append(filter_str)
+                logger.info(f"Добавлен фильтр colorchannelmixer для температуры={temperature} и тона={tint}: {filter_str}")
+        
+        return filters
+    
     def _build_speed_filters(self, speed: float) -> Tuple[List[str], List[str]]:
         """
         Строит фильтры для изменения скорости.
@@ -166,7 +311,14 @@ class FFmpegWorker:
         speed: float = 1.0,
         aspect_ratio: str = "16:9",
         input_width: int = 1920,
-        input_height: int = 1080
+        input_height: int = 1080,
+        brightness: float = 0.0,
+        contrast: float = 1.0,
+        saturation: float = 1.0,
+        sharpness: float = 0.0,
+        shadows: float = 0.0,
+        temperature: float = 0.0,
+        tint: float = 0.0
     ) -> List[str]:
         """Строит команду ffmpeg."""
         # Вычисляем длительность исходного видео для обрезки
@@ -230,6 +382,21 @@ class FFmpegWorker:
             audio_filters_list.append(f"atrim=start=0:duration={input_duration},asetpts=PTS-STARTPTS")
             audio_filters_list.extend(speed_audio_filters)
         
+        # Применяем фильтры цветокоррекции (если нужно)
+        # ВАЖНО: Применяем цветокоррекцию ПОСЛЕ trim/setpts, но ПЕРЕД aspect ratio
+        color_filters = self._build_color_filters(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            sharpness=sharpness,
+            shadows=shadows,
+            temperature=temperature,
+            tint=tint
+        )
+        if color_filters:
+            video_filters_list.extend(color_filters)
+            logger.info(f"Применены фильтры цветокоррекции: {color_filters}")
+        
         # Применяем фильтры соотношения сторон (если нужно)
         # Проверяем, нужно ли изменять соотношение сторон
         if aspect_ratio:
@@ -266,6 +433,11 @@ class FFmpegWorker:
             cmd.extend(["-c:a", encoding_profile.get("audio_codec", "aac")])
             cmd.extend(["-b:a", encoding_profile.get("audio_bitrate", "192k")])
         
+        # ВАЖНО: Добавляем параметры для обеспечения совместимости видео
+        # Эти параметры необходимы для корректного воспроизведения после применения фильтров
+        cmd.extend(["-pix_fmt", "yuv420p"])  # Совместимый формат пикселей (обязателен для большинства плееров)
+        cmd.extend(["-movflags", "+faststart"])  # Быстрый старт для веб-проигрывания
+        
         cmd.append(str(output_file))
         return cmd
     
@@ -280,7 +452,14 @@ class FFmpegWorker:
         speed: float = 1.0,
         aspect_ratio: str = "16:9",
         input_width: int = 1920,
-        input_height: int = 1080
+        input_height: int = 1080,
+        brightness: float = 0.0,
+        contrast: float = 1.0,
+        saturation: float = 1.0,
+        sharpness: float = 0.0,
+        shadows: float = 0.0,
+        temperature: float = 0.0,
+        tint: float = 0.0
     ) -> bool:
         """Выполняет команду ffmpeg."""
         if self.is_running:
@@ -289,9 +468,12 @@ class FFmpegWorker:
         
         cmd = self.build_command(
             input_file, output_file, start_time, end_time, filters, encoding_profile, 
-            speed, aspect_ratio, input_width, input_height
+            speed, aspect_ratio, input_width, input_height,
+            brightness, contrast, saturation, sharpness, shadows, temperature, tint
         )
         
+        logger.info(f"Параметры цветокоррекции: brightness={brightness}, contrast={contrast}, saturation={saturation}, "
+                   f"sharpness={sharpness}, shadows={shadows}, temperature={temperature}, tint={tint}")
         logger.info(f"Запуск ffmpeg: {' '.join(cmd)}")
         
         try:
@@ -319,10 +501,17 @@ class FFmpegWorker:
         if not self.process:
             return
         
+        error_lines = []
         try:
             for line in iter(self.process.stdout.readline, ''):
                 if not line:
                     break
+                
+                # Логируем ошибки для отладки
+                line_lower = line.lower()
+                if 'error' in line_lower or 'failed' in line_lower or 'invalid' in line_lower:
+                    error_lines.append(line.strip())
+                    logger.warning(f"FFmpeg: {line.strip()}")
                 
                 progress_data = self.parse_progress(line)
                 if progress_data and self.progress_callback:
@@ -342,6 +531,8 @@ class FFmpegWorker:
                     self.progress_callback(100.0, "Готово!")
             else:
                 logger.error(f"FFmpeg завершился с ошибкой: код {return_code}")
+                if error_lines:
+                    logger.error(f"Последние ошибки FFmpeg: {error_lines[-5:]}")
                 if self.progress_callback:
                     self.progress_callback(-1.0, f"Ошибка: код {return_code}")
         except Exception as e:

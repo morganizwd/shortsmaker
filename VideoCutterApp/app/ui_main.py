@@ -65,7 +65,14 @@ class ProcessingThread(QThread):
                 self.job.speed,
                 self.job.aspect_ratio,
                 input_width,
-                input_height
+                input_height,
+                self.job.brightness,
+                self.job.contrast,
+                self.job.saturation,
+                self.job.sharpness,
+                self.job.shadows,
+                self.job.temperature,
+                self.job.tint
             )
             
             if success:
@@ -253,6 +260,103 @@ class MainWindow(QMainWindow):
         aspect_layout.addStretch()
         aspect_group.setLayout(aspect_layout)
         
+        # Группа настроек цветокоррекции
+        color_group = QGroupBox("Цветокоррекция")
+        color_layout = QVBoxLayout()
+        
+        # Яркость
+        brightness_layout = QHBoxLayout()
+        brightness_label = QLabel("Яркость:")
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(-100, 100)  # -1.0 до 1.0 (будет делить на 100)
+        self.brightness_slider.setValue(0)
+        self.brightness_value_label = QLabel("0.0")
+        self.brightness_value_label.setMinimumWidth(50)
+        brightness_layout.addWidget(brightness_label)
+        brightness_layout.addWidget(self.brightness_slider)
+        brightness_layout.addWidget(self.brightness_value_label)
+        color_layout.addLayout(brightness_layout)
+        
+        # Контрастность
+        contrast_layout = QHBoxLayout()
+        contrast_label = QLabel("Контраст:")
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(0, 200)  # 0.0 до 2.0 (будет делить на 100)
+        self.contrast_slider.setValue(100)
+        self.contrast_value_label = QLabel("1.0")
+        self.contrast_value_label.setMinimumWidth(50)
+        contrast_layout.addWidget(contrast_label)
+        contrast_layout.addWidget(self.contrast_slider)
+        contrast_layout.addWidget(self.contrast_value_label)
+        color_layout.addLayout(contrast_layout)
+        
+        # Насыщенность
+        saturation_layout = QHBoxLayout()
+        saturation_label = QLabel("Насыщенность:")
+        self.saturation_slider = QSlider(Qt.Horizontal)
+        self.saturation_slider.setRange(0, 200)  # 0.0 до 2.0 (будет делить на 100)
+        self.saturation_slider.setValue(100)
+        self.saturation_value_label = QLabel("1.0")
+        self.saturation_value_label.setMinimumWidth(50)
+        saturation_layout.addWidget(saturation_label)
+        saturation_layout.addWidget(self.saturation_slider)
+        saturation_layout.addWidget(self.saturation_value_label)
+        color_layout.addLayout(saturation_layout)
+        
+        # Резкость
+        sharpness_layout = QHBoxLayout()
+        sharpness_label = QLabel("Резкость:")
+        self.sharpness_slider = QSlider(Qt.Horizontal)
+        self.sharpness_slider.setRange(-100, 100)  # -1.0 до 1.0 (будет делить на 100)
+        self.sharpness_slider.setValue(0)
+        self.sharpness_value_label = QLabel("0.0")
+        self.sharpness_value_label.setMinimumWidth(50)
+        sharpness_layout.addWidget(sharpness_label)
+        sharpness_layout.addWidget(self.sharpness_slider)
+        sharpness_layout.addWidget(self.sharpness_value_label)
+        color_layout.addLayout(sharpness_layout)
+        
+        # Тени
+        shadows_layout = QHBoxLayout()
+        shadows_label = QLabel("Тени:")
+        self.shadows_slider = QSlider(Qt.Horizontal)
+        self.shadows_slider.setRange(-100, 100)  # -1.0 до 1.0 (будет делить на 100)
+        self.shadows_slider.setValue(0)
+        self.shadows_value_label = QLabel("0.0")
+        self.shadows_value_label.setMinimumWidth(50)
+        shadows_layout.addWidget(shadows_label)
+        shadows_layout.addWidget(self.shadows_slider)
+        shadows_layout.addWidget(self.shadows_value_label)
+        color_layout.addLayout(shadows_layout)
+        
+        # Температура
+        temperature_layout = QHBoxLayout()
+        temperature_label = QLabel("Температура:")
+        self.temperature_slider = QSlider(Qt.Horizontal)
+        self.temperature_slider.setRange(-100, 100)  # -100 до 100
+        self.temperature_slider.setValue(0)
+        self.temperature_value_label = QLabel("0")
+        self.temperature_value_label.setMinimumWidth(50)
+        temperature_layout.addWidget(temperature_label)
+        temperature_layout.addWidget(self.temperature_slider)
+        temperature_layout.addWidget(self.temperature_value_label)
+        color_layout.addLayout(temperature_layout)
+        
+        # Тон
+        tint_layout = QHBoxLayout()
+        tint_label = QLabel("Тон:")
+        self.tint_slider = QSlider(Qt.Horizontal)
+        self.tint_slider.setRange(-100, 100)  # -100 до 100
+        self.tint_slider.setValue(0)
+        self.tint_value_label = QLabel("0")
+        self.tint_value_label.setMinimumWidth(50)
+        tint_layout.addWidget(tint_label)
+        tint_layout.addWidget(self.tint_slider)
+        tint_layout.addWidget(self.tint_value_label)
+        color_layout.addLayout(tint_layout)
+        
+        color_group.setLayout(color_layout)
+        
         # Группа профиля кодирования
         encoding_group = QGroupBox("Профиль кодирования")
         encoding_layout = QHBoxLayout()
@@ -293,6 +397,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(time_group)
         left_layout.addWidget(output_group)
         left_layout.addWidget(aspect_group)
+        left_layout.addWidget(color_group)
         left_layout.addWidget(encoding_group)
         left_layout.addWidget(self.progress_label)
         left_layout.addWidget(self.progress_bar)
@@ -339,6 +444,15 @@ class MainWindow(QMainWindow):
         self.timeline_slider.sliderReleased.connect(self.on_slider_released)
         self.timeline_slider.valueChanged.connect(self.on_slider_value_changed)
         self.speed_slider.valueChanged.connect(self.on_speed_changed)
+        
+        # Подключение обработчиков для слайдеров цветокоррекции
+        self.brightness_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('brightness', v, -100, 100))
+        self.contrast_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('contrast', v, 0, 200))
+        self.saturation_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('saturation', v, 0, 200))
+        self.sharpness_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('sharpness', v, -100, 100))
+        self.shadows_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('shadows', v, -100, 100))
+        self.temperature_slider.valueChanged.connect(self.on_temperature_changed)
+        self.tint_slider.valueChanged.connect(self.on_tint_changed)
     
     def log(self, message: str):
         """Добавляет сообщение в лог."""
@@ -404,6 +518,10 @@ class MainWindow(QMainWindow):
             
             # Загружаем видео без ограничения по времени
             self.player.play_file(video_path, 0.0, 0.0)  # 0.0 означает до конца
+            
+            # Применяем текущие настройки цветокоррекции после загрузки
+            QTimer.singleShot(300, lambda: self._apply_color_correction_to_preview())
+            
             # Настраиваем слайдер
             self.timeline_slider.setMaximum(int(duration * 1000))  # в миллисекундах
             self.timeline_slider.setEnabled(True)
@@ -412,6 +530,29 @@ class MainWindow(QMainWindow):
             self.time_label.setText(f"00:00:00.000 / {length_str}")
             # Автоматически ставим на паузу после загрузки
             QTimer.singleShot(500, lambda: self._pause_after_load())
+    
+    def _apply_color_correction_to_preview(self):
+        """Применяет текущие настройки цветокоррекции к предпросмотру."""
+        if not self.player:
+            return
+        
+        brightness = self.brightness_slider.value() / 100.0
+        contrast = self.contrast_slider.value() / 100.0
+        saturation = self.saturation_slider.value() / 100.0
+        sharpness = self.sharpness_slider.value() / 100.0
+        shadows = self.shadows_slider.value() / 100.0
+        temperature = self.temperature_slider.value()
+        tint = self.tint_slider.value()
+        
+        self.player.set_color_correction(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            sharpness=sharpness,
+            shadows=shadows,
+            temperature=temperature,
+            tint=tint
+        )
     
     def _pause_after_load(self):
         """Ставит видео на паузу после загрузки."""
@@ -495,6 +636,10 @@ class MainWindow(QMainWindow):
         
         # Загружаем видео с указанным диапазоном
         self.player.play_file(Path(input_path), start_time, end_time)
+        
+        # Применяем текущие настройки цветокоррекции после загрузки
+        QTimer.singleShot(300, lambda: self._apply_color_correction_to_preview())
+        
         # Настраиваем слайдер для предпросмотра
         if self.video_info:
             duration = self.video_info.get("duration", 0)
@@ -532,6 +677,15 @@ class MainWindow(QMainWindow):
         # Получаем соотношение сторон
         aspect_ratio = self.aspect_ratio_combo.currentText()
         
+        # Получаем параметры цветокоррекции
+        brightness = self.brightness_slider.value() / 100.0
+        contrast = self.contrast_slider.value() / 100.0
+        saturation = self.saturation_slider.value() / 100.0
+        sharpness = self.sharpness_slider.value() / 100.0
+        shadows = self.shadows_slider.value() / 100.0
+        temperature = self.temperature_slider.value()
+        tint = self.tint_slider.value()
+        
         # Создание задачи
         job = Job(
             input_file=Path(input_path),
@@ -540,6 +694,13 @@ class MainWindow(QMainWindow):
             end_time=end_time,
             speed=speed,
             aspect_ratio=aspect_ratio,
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            sharpness=sharpness,
+            shadows=shadows,
+            temperature=temperature,
+            tint=tint,
             encoding_profile=ENCODING_PROFILES[self.encoding_profile_combo.currentText()]
         )
         
@@ -748,6 +909,88 @@ class MainWindow(QMainWindow):
         # Устанавливаем скорость в плеере
         if self.player:
             self.player.set_rate(speed)
+    
+    def on_color_slider_changed(self, param_name: str, value: int, min_val: int, max_val: int):
+        """Обработчик изменения слайдеров цветокоррекции (кроме температуры и тона)."""
+        # Конвертируем значение слайдера в реальное значение
+        if param_name in ['brightness', 'sharpness', 'shadows']:
+            # Для параметров от -1.0 до 1.0
+            real_value = value / 100.0
+            label = getattr(self, f"{param_name}_value_label")
+            label.setText(f"{real_value:.2f}")
+        elif param_name in ['contrast', 'saturation']:
+            # Для параметров от 0.0 до 2.0
+            real_value = value / 100.0
+            label = getattr(self, f"{param_name}_value_label")
+            label.setText(f"{real_value:.2f}")
+        
+        # Применяем цветокоррекцию к предпросмотру
+        if self.player:
+            brightness = self.brightness_slider.value() / 100.0
+            contrast = self.contrast_slider.value() / 100.0
+            saturation = self.saturation_slider.value() / 100.0
+            sharpness = self.sharpness_slider.value() / 100.0
+            shadows = self.shadows_slider.value() / 100.0
+            temperature = self.temperature_slider.value()
+            tint = self.tint_slider.value()
+            
+            self.player.set_color_correction(
+                brightness=brightness,
+                contrast=contrast,
+                saturation=saturation,
+                sharpness=sharpness,
+                shadows=shadows,
+                temperature=temperature,
+                tint=tint
+            )
+    
+    def on_temperature_changed(self, value: int):
+        """Обработчик изменения температуры."""
+        self.temperature_value_label.setText(str(value))
+        
+        # Применяем цветокоррекцию к предпросмотру
+        if self.player:
+            brightness = self.brightness_slider.value() / 100.0
+            contrast = self.contrast_slider.value() / 100.0
+            saturation = self.saturation_slider.value() / 100.0
+            sharpness = self.sharpness_slider.value() / 100.0
+            shadows = self.shadows_slider.value() / 100.0
+            temperature = value
+            tint = self.tint_slider.value()
+            
+            self.player.set_color_correction(
+                brightness=brightness,
+                contrast=contrast,
+                saturation=saturation,
+                sharpness=sharpness,
+                shadows=shadows,
+                temperature=temperature,
+                tint=tint
+            )
+    
+    def on_tint_changed(self, value: int):
+        """Обработчик изменения тона."""
+        self.tint_value_label.setText(str(value))
+        
+        # Применяем цветокоррекцию к предпросмотру
+        if self.player:
+            brightness = self.brightness_slider.value() / 100.0
+            contrast = self.contrast_slider.value() / 100.0
+            saturation = self.saturation_slider.value() / 100.0
+            sharpness = self.sharpness_slider.value() / 100.0
+            shadows = self.shadows_slider.value() / 100.0
+            temperature = self.temperature_slider.value()
+            tint = value
+            
+            self.player.set_color_correction(
+                brightness=brightness,
+                contrast=contrast,
+                saturation=saturation,
+                sharpness=sharpness,
+                shadows=shadows,
+                temperature=temperature,
+                tint=tint
+            )
     
     def on_aspect_ratio_changed(self, aspect_ratio: str):
         """Обработчик изменения соотношения сторон."""
