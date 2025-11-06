@@ -268,8 +268,8 @@ class MainWindow(QMainWindow):
         brightness_layout = QHBoxLayout()
         brightness_label = QLabel("Яркость:")
         self.brightness_slider = QSlider(Qt.Horizontal)
-        self.brightness_slider.setRange(-100, 100)  # -1.0 до 1.0 (будет делить на 100)
-        self.brightness_slider.setValue(0)
+        self.brightness_slider.setRange(0, 200)  # 0-200, где 100 = 0.0 (нейтральная яркость)
+        self.brightness_slider.setValue(100)  # Дефолт = нейтральная яркость
         self.brightness_value_label = QLabel("0.0")
         self.brightness_value_label.setMinimumWidth(50)
         brightness_layout.addWidget(brightness_label)
@@ -446,7 +446,7 @@ class MainWindow(QMainWindow):
         self.speed_slider.valueChanged.connect(self.on_speed_changed)
         
         # Подключение обработчиков для слайдеров цветокоррекции
-        self.brightness_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('brightness', v, -100, 100))
+        self.brightness_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('brightness', v, 0, 200))
         self.contrast_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('contrast', v, 0, 200))
         self.saturation_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('saturation', v, 0, 200))
         self.sharpness_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('sharpness', v, -100, 100))
@@ -536,7 +536,7 @@ class MainWindow(QMainWindow):
         if not self.player:
             return
         
-        brightness = self.brightness_slider.value() / 100.0
+        brightness = (self.brightness_slider.value() - 100) / 100.0
         contrast = self.contrast_slider.value() / 100.0
         saturation = self.saturation_slider.value() / 100.0
         sharpness = self.sharpness_slider.value() / 100.0
@@ -678,7 +678,7 @@ class MainWindow(QMainWindow):
         aspect_ratio = self.aspect_ratio_combo.currentText()
         
         # Получаем параметры цветокоррекции
-        brightness = self.brightness_slider.value() / 100.0
+        brightness = (self.brightness_slider.value() - 100) / 100.0
         contrast = self.contrast_slider.value() / 100.0
         saturation = self.saturation_slider.value() / 100.0
         sharpness = self.sharpness_slider.value() / 100.0
@@ -913,7 +913,12 @@ class MainWindow(QMainWindow):
     def on_color_slider_changed(self, param_name: str, value: int, min_val: int, max_val: int):
         """Обработчик изменения слайдеров цветокоррекции (кроме температуры и тона)."""
         # Конвертируем значение слайдера в реальное значение
-        if param_name in ['brightness', 'sharpness', 'shadows']:
+        if param_name == 'brightness':
+            # Для яркости: 0-200 -> -1.0 до 1.0, где 100 = 0.0
+            real_value = (value - 100) / 100.0
+            label = getattr(self, f"{param_name}_value_label")
+            label.setText(f"{real_value:.2f}")
+        elif param_name in ['sharpness', 'shadows']:
             # Для параметров от -1.0 до 1.0
             real_value = value / 100.0
             label = getattr(self, f"{param_name}_value_label")
@@ -926,7 +931,7 @@ class MainWindow(QMainWindow):
         
         # Применяем цветокоррекцию к предпросмотру
         if self.player:
-            brightness = self.brightness_slider.value() / 100.0
+            brightness = (self.brightness_slider.value() - 100) / 100.0
             contrast = self.contrast_slider.value() / 100.0
             saturation = self.saturation_slider.value() / 100.0
             sharpness = self.sharpness_slider.value() / 100.0
@@ -950,7 +955,7 @@ class MainWindow(QMainWindow):
         
         # Применяем цветокоррекцию к предпросмотру
         if self.player:
-            brightness = self.brightness_slider.value() / 100.0
+            brightness = (self.brightness_slider.value() - 100) / 100.0
             contrast = self.contrast_slider.value() / 100.0
             saturation = self.saturation_slider.value() / 100.0
             sharpness = self.sharpness_slider.value() / 100.0
@@ -974,7 +979,7 @@ class MainWindow(QMainWindow):
         
         # Применяем цветокоррекцию к предпросмотру
         if self.player:
-            brightness = self.brightness_slider.value() / 100.0
+            brightness = (self.brightness_slider.value() - 100) / 100.0
             contrast = self.contrast_slider.value() / 100.0
             saturation = self.saturation_slider.value() / 100.0
             sharpness = self.sharpness_slider.value() / 100.0

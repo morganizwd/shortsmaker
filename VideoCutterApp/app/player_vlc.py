@@ -4,10 +4,13 @@
 
 import sys
 import vlc
+import tempfile
+import subprocess
 from pathlib import Path
 from typing import Optional
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, QThread, Signal
 from app.utils.logger import get_logger
+from app.ffmpeg_worker import FFmpegWorker
 
 logger = get_logger(__name__)
 
@@ -43,6 +46,15 @@ class VLCPlayer:
         self.sharpness: float = 0.0
         self.temperature: float = 0.0
         self.tint: float = 0.0
+        
+        # Для предпросмотра с FFmpeg фильтрами
+        self.use_ffmpeg_preview: bool = False  # Использовать FFmpeg для предпросмотра (по умолчанию выключено из-за медленности)
+        self.preview_temp_file: Optional[Path] = None
+        self.ffmpeg_worker = FFmpegWorker()
+        self._preview_update_timer = QTimer()
+        self._preview_update_timer.setSingleShot(True)
+        self._preview_update_timer.timeout.connect(self._update_preview_debounced)
+        self._pending_color_params = None  # Параметры для отложенного обновления
         
         try:
             # Создаем instance с опциями для поддержки фильтров
@@ -515,6 +527,198 @@ class VLCPlayer:
             return self.player.get_rate()
         return 1.0
     
+    class PreviewThread(QThread):
+        """Поток для создания предпросмотра с FFmpeg фильтрами."""
+        preview_ready = Signal(Path)
+        preview_failed = Signal(str)
+        
+        def __init__(self, ffmpeg_worker, input_file, start_time, end_time, brightness, contrast, 
+                     saturation, sharpness, shadows, temperature, tint, aspect_ratio, speed,
+                     video_width, video_height, temp_file_path):
+            super().__init__()
+            self.ffmpeg_worker = ffmpeg_worker
+            self.input_file = input_file
+            self.start_time = start_time
+            self.end_time = end_time
+            self.brightness = brightness
+            self.contrast = contrast
+            self.saturation = saturation
+            self.sharpness = sharpness
+            self.shadows = shadows
+            self.temperature = temperature
+            self.tint = tint
+            self.aspect_ratio = aspect_ratio
+            self.speed = speed
+            self.video_width = video_width
+            self.video_height = video_height
+            self.temp_file_path = temp_file_path
+        
+        def run(self):
+            """Создает предпросмотр в отдельном потоке."""
+            try:
+                # Используем FFmpegWorker для создания предпросмотра
+                preview_profile = {
+                    "codec": "libx264",
+                    "preset": "ultrafast",
+                    "crf": "28",
+                    "audio_codec": "aac",
+                    "audio_bitrate": "128k"
+                }
+                
+                # Вычисляем длительность
+                input_duration = self.end_time - self.start_time if self.end_time > self.start_time else 0.0
+                if input_duration <= 0:
+                    input_duration = 10.0
+                    self.end_time = self.start_time + input_duration
+                
+                # Создаем команду FFmpeg
+                cmd = self.ffmpeg_worker.build_command(
+                    input_file=self.input_file,
+                    output_file=self.temp_file_path,
+                    start_time=self.start_time,
+                    end_time=self.end_time,
+                    filters=None,
+                    encoding_profile=preview_profile,
+                    speed=self.speed,
+                    aspect_ratio=self.aspect_ratio,
+                    input_width=self.video_width,
+                    input_height=self.video_height,
+                    brightness=self.brightness,
+                    contrast=self.contrast,
+                    saturation=self.saturation,
+                    sharpness=self.sharpness,
+                    shadows=self.shadows,
+                    temperature=self.temperature,
+                    tint=self.tint
+                )
+                
+                # Запускаем FFmpeg
+                logger.info(f"Создание предпросмотра с FFmpeg фильтрами: {self.temp_file_path}")
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True
+                )
+                
+                # Ждем завершения (с таймаутом)
+                try:
+                    stdout, stderr = process.communicate(timeout=30)
+                    if process.returncode == 0 and self.temp_file_path.exists():
+                        logger.info(f"Предпросмотр создан: {self.temp_file_path}")
+                        self.preview_ready.emit(self.temp_file_path)
+                    else:
+                        error_msg = stderr if stderr else "Неизвестная ошибка"
+                        logger.error(f"Ошибка создания предпросмотра: {error_msg}")
+                        self.preview_failed.emit(error_msg)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    logger.error("Таймаут при создании предпросмотра")
+                    self.preview_failed.emit("Таймаут при создании предпросмотра")
+                    
+            except Exception as e:
+                logger.error(f"Ошибка создания предпросмотра с FFmpeg: {e}")
+                self.preview_failed.emit(str(e))
+    
+    def _update_preview_debounced(self):
+        """Обновляет предпросмотр после задержки (debounce)."""
+        if not self._pending_color_params:
+            return
+        
+        params = self._pending_color_params
+        self._pending_color_params = None
+        
+        if not self.current_file or not self.current_file.exists():
+            return
+        
+        # Получаем текущую скорость
+        current_rate = self.get_rate()
+        
+        # Вычисляем end_time для предпросмотра
+        preview_end_time = self.end_time if self.end_time > self.start_time else 0.0
+        if preview_end_time == 0.0:
+            video_length = self.get_length()
+            if video_length > 0:
+                preview_end_time = min(self.start_time + 10.0, video_length)
+            else:
+                preview_end_time = self.start_time + 10.0
+        
+        # Удаляем старый временный файл, если он существует
+        if self.preview_temp_file and self.preview_temp_file.exists():
+            try:
+                self.preview_temp_file.unlink()
+            except:
+                pass
+        
+        # Создаем новый временный файл
+        temp_dir = tempfile.gettempdir()
+        temp_file = Path(temp_dir) / f"videocutter_preview_{id(self)}.mp4"
+        self.preview_temp_file = temp_file
+        
+        # Создаем поток для создания предпросмотра
+        self._preview_thread = self.PreviewThread(
+            self.ffmpeg_worker,
+            self.current_file,
+            self.start_time,
+            preview_end_time,
+            params['brightness'],
+            params['contrast'],
+            params['saturation'],
+            params['sharpness'],
+            params['shadows'],
+            params['temperature'],
+            params['tint'],
+            params['aspect_ratio'],
+            current_rate,
+            self.video_width,
+            self.video_height,
+            temp_file
+        )
+        self._preview_thread.preview_ready.connect(self._on_preview_ready)
+        self._preview_thread.preview_failed.connect(self._on_preview_failed)
+        self._preview_thread.start()
+    
+    def _on_preview_ready(self, preview_file: Path):
+        """Обработчик успешного создания предпросмотра."""
+        if preview_file and preview_file.exists():
+            # Воспроизводим временный файл
+            was_playing = self.is_playing()
+            current_pos = self.get_time()
+            
+            # Останавливаем текущее воспроизведение
+            self.stop()
+            
+            # Загружаем новый файл
+            self.play_file(preview_file, 0.0, 0.0)
+            
+            # Восстанавливаем позицию и состояние воспроизведения
+            if current_pos > 0:
+                QTimer.singleShot(500, lambda: self.set_time(current_pos))
+            if was_playing:
+                QTimer.singleShot(600, lambda: self.play())
+            
+            # ВАЖНО: Отключаем video_adjust, чтобы не "удваивать" коррекцию
+            try:
+                if hasattr(self.player, 'video_set_adjust_float'):
+                    self.player.video_set_adjust_float(vlc.VideoAdjustOption.Enable, 0.0)
+                elif hasattr(self.player, 'video_set_adjust_int'):
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Enable, 0)
+            except Exception:
+                pass
+            
+            logger.info("Предпросмотр обновлен с применением FFmpeg фильтров")
+    
+    def _on_preview_failed(self, error_msg: str):
+        """Обработчик ошибки создания предпросмотра."""
+        logger.error(f"Не удалось создать предпросмотр: {error_msg}")
+        # Fallback: используем стандартный метод VLC
+        self.use_ffmpeg_preview = False
+        # Применяем цветокоррекцию через VLC
+        self._apply_vlc_color_correction(
+            self.brightness, self.contrast, self.saturation, 
+            self.sharpness, self.shadows, self.temperature, self.tint
+        )
+    
     def set_color_correction(
         self,
         brightness: float = 0.0,
@@ -537,7 +741,7 @@ class VLCPlayer:
             temperature: Температура (-100 до 100)
             tint: Тон (-100 до 100)
         """
-        if not self.player:
+        if not self.player or not self.current_file:
             return
         
         # Сохраняем параметры
@@ -556,93 +760,126 @@ class VLCPlayer:
         else:
             self.gamma = 1.0
         
+        # Если используем FFmpeg для предпросмотра, планируем обновление с задержкой (debounce)
+        if self.use_ffmpeg_preview:
+            # Сохраняем параметры для отложенного обновления
+            self._pending_color_params = {
+                'brightness': brightness,
+                'contrast': contrast,
+                'saturation': saturation,
+                'sharpness': sharpness,
+                'shadows': shadows,
+                'temperature': temperature,
+                'tint': tint,
+                'aspect_ratio': self.aspect_ratio or "16:9"
+            }
+            # Перезапускаем таймер (debounce: обновляем только после остановки движения слайдера)
+            self._preview_update_timer.stop()
+            self._preview_update_timer.start(500)  # 500мс задержка
+            return
+        
+        # Иначе используем стандартный метод VLC
+        self._apply_vlc_color_correction(brightness, contrast, saturation, sharpness, shadows, temperature, tint)
+    
+    def _apply_vlc_color_correction(
+        self,
+        brightness: float,
+        contrast: float,
+        saturation: float,
+        sharpness: float,
+        shadows: float,
+        temperature: float,
+        tint: float
+    ):
+        """Применяет цветокоррекцию через VLC video_adjust."""
         try:
-            # VLC использует video_adjust для цветокоррекции
-            # Диапазоны значений в VLC:
-            # brightness: -1.0 до 1.0
-            # contrast: 0.0 до 2.0
-            # saturation: 0.0 до 3.0
-            # hue: -180.0 до 180.0 (используется для тона)
-            # gamma: 0.01 до 10.0
+            # Проверяем, есть ли какие-либо настройки, которые нужно применить
+            has_adjustments = (
+                abs(brightness) >= 0.01 or
+                abs(contrast - 1.0) >= 0.01 or
+                abs(saturation - 1.0) >= 0.01 or
+                abs(self.gamma - 1.0) >= 0.01 or
+                abs(tint) >= 0.01 or
+                abs(temperature) >= 0.01
+            )
             
-            # Применяем яркость
-            brightness_vlc = max(-1.0, min(1.0, brightness))
-            if hasattr(self.player, 'video_set_adjust_int') or hasattr(self.player, 'video_set_adjust_float'):
+            # Включаем или отключаем video_adjust в зависимости от наличия настроек
+            if hasattr(self.player, 'video_set_adjust_float') or hasattr(self.player, 'video_set_adjust_int'):
                 try:
-                    # VLC 3.x использует video_set_adjust_float
                     if hasattr(self.player, 'video_set_adjust_float'):
-                        self.player.video_set_adjust_float(vlc.VideoAdjustOption.Enable, 1.0)
-                        self.player.video_set_adjust_float(vlc.VideoAdjustOption.Brightness, brightness_vlc)
+                        # Включаем только если есть настройки, иначе отключаем
+                        enable_value = 1.0 if has_adjustments else 0.0
+                        self.player.video_set_adjust_float(vlc.VideoAdjustOption.Enable, enable_value)
+                        logger.debug(f"Video adjust Enable установлен: {enable_value}")
+                        
+                        # ВАЖНО: Если включаем, сначала сбрасываем все значения на нейтральные
+                        if enable_value > 0:
+                            self.player.video_set_adjust_float(vlc.VideoAdjustOption.Brightness, 1.0)  # Нейтраль = 1.0!
+                            self.player.video_set_adjust_float(vlc.VideoAdjustOption.Contrast, 1.0)
+                            self.player.video_set_adjust_float(vlc.VideoAdjustOption.Saturation, 1.0)
+                            self.player.video_set_adjust_float(vlc.VideoAdjustOption.Gamma, 1.0)
+                            self.player.video_set_adjust_float(vlc.VideoAdjustOption.Hue, 0.0)
+                            logger.debug("Все параметры video_adjust сброшены на нейтральные значения")
                     elif hasattr(self.player, 'video_set_adjust_int'):
-                        # VLC 2.x может использовать int
-                        self.player.video_set_adjust_int(vlc.VideoAdjustOption.Enable, 1)
-                        brightness_int = int(brightness_vlc * 100)
-                        self.player.video_set_adjust_int(vlc.VideoAdjustOption.Brightness, brightness_int)
+                        enable_value = 1 if has_adjustments else 0
+                        self.player.video_set_adjust_int(vlc.VideoAdjustOption.Enable, enable_value)
+                        logger.debug(f"Video adjust Enable установлен: {enable_value}")
+                        
+                        # ВАЖНО: Если включаем, сначала сбрасываем все значения на нейтральные
+                        if enable_value > 0:
+                            self.player.video_set_adjust_int(vlc.VideoAdjustOption.Brightness, 100)  # 1.0 * 100
+                            self.player.video_set_adjust_int(vlc.VideoAdjustOption.Contrast, 100)  # 1.0 * 100
+                            self.player.video_set_adjust_int(vlc.VideoAdjustOption.Saturation, 100)  # 1.0 * 100
+                            self.player.video_set_adjust_int(vlc.VideoAdjustOption.Gamma, 100)  # 1.0 * 100
+                            self.player.video_set_adjust_int(vlc.VideoAdjustOption.Hue, 0)
+                            logger.debug("Все параметры video_adjust сброшены на нейтральные значения")
                 except Exception as e:
-                    logger.debug(f"Не удалось установить brightness через video_adjust: {e}")
+                    logger.debug(f"Не удалось установить Enable через video_adjust: {e}")
             
-            # Применяем контрастность
-            contrast_vlc = max(0.0, min(2.0, contrast))
+            # Если нет настроек, выходим
+            if not has_adjustments:
+                return
+            
+            # Применяем значения слайдеров, корректно промапив под VLC
             try:
+                # ВАЖНО: В VLC нейтральная яркость = 1.0, а не 0.0!
+                # Маппинг: brightness ∈ [-1..1] → [0..2], где 1.0 = нейтраль
+                brightness_vlc = max(0.0, min(2.0, 1.0 + brightness))
+                
+                contrast_vlc = max(0.0, min(2.0, contrast))  # Нейтраль 1.0
+                saturation_vlc = max(0.0, min(3.0, saturation))  # Нейтраль 1.0
+                gamma_vlc = max(0.01, min(10.0, self.gamma))  # Нейтраль 1.0
+                
+                # Hue: tint преобразуем в градусы, затем нормализуем к 0..360
+                hue_deg = tint * 1.8  # -180..180
+                # Температура также влияет на hue
+                if abs(temperature) >= 0.01:
+                    hue_deg += (temperature / 100.0) * 30.0
+                hue_vlc = (hue_deg + 360.0) % 360.0  # 0..360
+                
                 if hasattr(self.player, 'video_set_adjust_float'):
+                    self.player.video_set_adjust_float(vlc.VideoAdjustOption.Brightness, brightness_vlc)
                     self.player.video_set_adjust_float(vlc.VideoAdjustOption.Contrast, contrast_vlc)
-                elif hasattr(self.player, 'video_set_adjust_int'):
-                    contrast_int = int(contrast_vlc * 100)
-                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Contrast, contrast_int)
-            except Exception as e:
-                logger.debug(f"Не удалось установить contrast: {e}")
-            
-            # Применяем насыщенность с учетом температуры
-            # Температура может влиять на насыщенность
-            saturation_vlc = max(0.0, min(3.0, saturation))
-            if abs(temperature) >= 0.01:
-                # Температура влияет на насыщенность
-                temp_factor = temperature / 100.0
-                saturation_vlc = saturation_vlc * (1.0 + temp_factor * 0.2)
-                saturation_vlc = max(0.0, min(3.0, saturation_vlc))
-            
-            try:
-                if hasattr(self.player, 'video_set_adjust_float'):
                     self.player.video_set_adjust_float(vlc.VideoAdjustOption.Saturation, saturation_vlc)
-                elif hasattr(self.player, 'video_set_adjust_int'):
-                    saturation_int = int(saturation_vlc * 100)
-                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Saturation, saturation_int)
-            except Exception as e:
-                logger.debug(f"Не удалось установить saturation: {e}")
-            
-            # Применяем gamma (для теней)
-            gamma_vlc = max(0.01, min(10.0, self.gamma))
-            try:
-                if hasattr(self.player, 'video_set_adjust_float'):
                     self.player.video_set_adjust_float(vlc.VideoAdjustOption.Gamma, gamma_vlc)
+                    self.player.video_set_adjust_float(vlc.VideoAdjustOption.Hue, hue_vlc)
+                    logger.debug(f"Применены значения VLC: brightness={brightness_vlc:.2f}, contrast={contrast_vlc:.2f}, "
+                               f"saturation={saturation_vlc:.2f}, gamma={gamma_vlc:.2f}, hue={hue_vlc:.2f}")
                 elif hasattr(self.player, 'video_set_adjust_int'):
+                    brightness_int = int(brightness_vlc * 100)
+                    contrast_int = int(contrast_vlc * 100)
+                    saturation_int = int(saturation_vlc * 100)
                     gamma_int = int(gamma_vlc * 100)
+                    hue_int = int(hue_vlc)
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Brightness, brightness_int)
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Contrast, contrast_int)
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Saturation, saturation_int)
                     self.player.video_set_adjust_int(vlc.VideoAdjustOption.Gamma, gamma_int)
+                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Hue, hue_int)
+                    logger.debug(f"Применены значения VLC (int): brightness={brightness_int}, contrast={contrast_int}, "
+                               f"saturation={saturation_int}, gamma={gamma_int}, hue={hue_int}")
             except Exception as e:
-                logger.debug(f"Не удалось установить gamma: {e}")
-            
-            # Применяем тон (tint) через hue
-            # tint преобразуем в hue: -100 до 100 -> -180 до 180 градусов
-            hue_vlc = 0.0
-            if abs(tint) >= 0.01:
-                hue_vlc = max(-180.0, min(180.0, tint * 1.8))
-            
-            # Температура также влияет на hue (для более реалистичного эффекта)
-            if abs(temperature) >= 0.01:
-                temp_factor = temperature / 100.0
-                # Теплее сдвигает в сторону желтого (положительный hue), холоднее в сторону синего (отрицательный)
-                hue_vlc += temp_factor * 30.0  # Смещение hue для температуры
-                hue_vlc = max(-180.0, min(180.0, hue_vlc))
-            
-            if abs(hue_vlc) >= 0.01:
-                try:
-                    if hasattr(self.player, 'video_set_adjust_float'):
-                        self.player.video_set_adjust_float(vlc.VideoAdjustOption.Hue, hue_vlc)
-                    elif hasattr(self.player, 'video_set_adjust_int'):
-                        hue_int = int(hue_vlc)
-                        self.player.video_set_adjust_int(vlc.VideoAdjustOption.Hue, hue_int)
-                except Exception as e:
-                    logger.debug(f"Не удалось установить hue: {e}")
+                logger.debug(f"Не удалось применить значения через video_adjust: {e}")
             
             logger.info(f"Применена цветокоррекция: brightness={brightness:.2f}, contrast={contrast:.2f}, "
                        f"saturation={saturation:.2f}, shadows={shadows:.2f}, temperature={temperature}, tint={tint}")
@@ -657,4 +894,12 @@ class VLCPlayer:
             self.player.release()
         if self.instance:
             self.instance.release()
+        
+        # Удаляем временный файл предпросмотра
+        if self.preview_temp_file and self.preview_temp_file.exists():
+            try:
+                self.preview_temp_file.unlink()
+                logger.info(f"Временный файл предпросмотра удален: {self.preview_temp_file}")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временный файл предпросмотра: {e}")
 
