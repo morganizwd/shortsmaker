@@ -7,7 +7,7 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QLabel, QComboBox, QCheckBox, QLineEdit, QFileDialog,
-    QMessageBox, QSlider, QAbstractItemView
+    QMessageBox, QSlider, QAbstractItemView, QProgressBar
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QRect, QPoint
 from PySide6.QtGui import QShortcut, QKeySequence, QColor, QPainter, QPen, QBrush, QPolygon
@@ -271,6 +271,7 @@ class SegmentsModeWidget(QWidget):
         super().__init__(parent)
         self.project: Optional[Project] = None
         self.current_segment_index: int = -1
+        self.export_in_progress: bool = False
         self.init_ui()
     
     def init_ui(self):
@@ -368,6 +369,23 @@ class SegmentsModeWidget(QWidget):
         project_buttons_layout.addWidget(self.export_btn)
         
         export_layout.addLayout(project_buttons_layout)
+        
+        # Прогресс-бар для экспорта
+        progress_layout = QVBoxLayout()
+        self.export_progress_bar = QProgressBar()
+        self.export_progress_bar.setMinimum(0)
+        self.export_progress_bar.setMaximum(100)
+        self.export_progress_bar.setValue(0)
+        self.export_progress_bar.setVisible(False)  # Скрыт по умолчанию
+        
+        self.export_status_label = QLabel("")
+        self.export_status_label.setVisible(False)  # Скрыт по умолчанию
+        
+        progress_layout.addWidget(self.export_progress_bar)
+        progress_layout.addWidget(self.export_status_label)
+        
+        export_layout.addLayout(progress_layout)
+        
         export_group.setLayout(export_layout)
         layout.addWidget(export_group)
         
@@ -476,4 +494,32 @@ class SegmentsModeWidget(QWidget):
     def set_current_time(self, time: float):
         """Устанавливает текущее время воспроизведения."""
         self.timeline_widget.set_current_time(time)
+    
+    def set_export_progress(self, current: int, total: int, message: str = ""):
+        """Устанавливает прогресс экспорта."""
+        if total > 0:
+            progress_percent = int((current / total) * 100)
+            self.export_progress_bar.setValue(progress_percent)
+            if message:
+                self.export_status_label.setText(f"{message} ({current}/{total})")
+            else:
+                self.export_status_label.setText(f"Прогресс: {current}/{total} ({progress_percent}%)")
+        else:
+            # Для concat режима - устанавливаем просто процент
+            if message:
+                self.export_status_label.setText(message)
+    
+    def show_export_progress(self, show: bool = True):
+        """Показывает или скрывает прогресс-бар экспорта."""
+        self.export_progress_bar.setVisible(show)
+        self.export_status_label.setVisible(show)
+        if not show:
+            self.export_progress_bar.setValue(0)
+            self.export_status_label.setText("")
+    
+    def reset_export_progress(self):
+        """Сбрасывает прогресс экспорта."""
+        self.export_progress_bar.setValue(0)
+        self.export_status_label.setText("")
+        self.show_export_progress(False)
 

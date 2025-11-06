@@ -44,6 +44,8 @@ class SegmentWorker:
     ) -> List[Path]:
         """
         Экспортирует сегменты в отдельные файлы (быстрый режим, без перекодирования).
+        Если сегмент требует применения фильтров (aspect ratio, speed, color correction),
+        автоматически переключается на перекодирование.
         
         Args:
             input_file: Входной видео файл
@@ -67,6 +69,48 @@ class SegmentWorker:
         completed = 0
         output_files = []
         
+        # Получаем информацию о видео для проверки aspect ratio
+        from app.ffprobe_utils import get_video_info
+        video_info = get_video_info(input_file)
+        input_width = video_info.get("width", 1920) if video_info else 1920
+        input_height = video_info.get("height", 1080) if video_info else 1080
+        
+        def needs_reencoding(segment: Segment) -> bool:
+            """Проверяет, требуется ли перекодирование для сегмента."""
+            # Проверяем aspect ratio
+            current_aspect = input_width / input_height if input_height > 0 else 1.0
+            if segment.aspect_ratio == "16:9":
+                target_aspect = 16 / 9
+            elif segment.aspect_ratio == "9:16":
+                target_aspect = 9 / 16
+            else:
+                target_aspect = current_aspect
+            
+            if abs(current_aspect - target_aspect) >= 0.01:
+                return True
+            
+            # Проверяем скорость (не равна 1.0)
+            if abs(segment.speed - 1.0) > 0.01:
+                return True
+            
+            # Проверяем цветокоррекцию (не равны значениям по умолчанию)
+            if abs(segment.brightness) > 0.01:
+                return True
+            if abs(segment.contrast - 1.0) > 0.01:
+                return True
+            if abs(segment.saturation - 1.0) > 0.01:
+                return True
+            if abs(segment.sharpness) > 0.01:
+                return True
+            if abs(segment.shadows) > 0.01:
+                return True
+            if abs(segment.temperature) > 0.01:
+                return True
+            if abs(segment.tint) > 0.01:
+                return True
+            
+            return False
+        
         def process_segment(segment: Segment, index: int) -> Optional[Path]:
             """Обрабатывает один сегмент."""
             if self.cancelled:
@@ -82,19 +126,44 @@ class SegmentWorker:
             output_file = output_dir / output_filename
             
             try:
-                duration = segment.end_time - segment.start_time
-                
-                # Быстрый режим: используем -c copy (без перекодирования)
-                cmd = [
-                    "ffmpeg",
-                    "-y",  # Перезаписать выходной файл
-                    "-ss", str(segment.start_time),
-                    "-i", str(input_file),
-                    "-t", str(duration),
-                    "-c", "copy",  # Копирование без перекодирования
-                    "-movflags", "+faststart",
-                    str(output_file)
-                ]
+                # Проверяем, нужно ли перекодирование
+                if needs_reencoding(segment):
+                    # Используем точный режим с перекодированием
+                    logger.info(f"Сегмент {index + 1} требует перекодирования (фильтры), используем точный режим")
+                    profile = ENCODING_PROFILES.get(segment.encoding_profile, ENCODING_PROFILES["balanced"])
+                    
+                    cmd = self.ffmpeg_worker.build_command(
+                        input_file=input_file,
+                        output_file=output_file,
+                        start_time=segment.start_time,
+                        end_time=segment.end_time,
+                        filters=None,
+                        encoding_profile=profile,
+                        speed=segment.speed,
+                        aspect_ratio=segment.aspect_ratio,
+                        input_width=input_width,
+                        input_height=input_height,
+                        brightness=segment.brightness,
+                        contrast=segment.contrast,
+                        saturation=segment.saturation,
+                        sharpness=segment.sharpness,
+                        shadows=segment.shadows,
+                        temperature=segment.temperature,
+                        tint=segment.tint
+                    )
+                else:
+                    # Быстрый режим: используем -c copy (без перекодирования)
+                    duration = segment.end_time - segment.start_time
+                    cmd = [
+                        "ffmpeg",
+                        "-y",  # Перезаписать выходной файл
+                        "-ss", str(segment.start_time),
+                        "-i", str(input_file),
+                        "-t", str(duration),
+                        "-c", "copy",  # Копирование без перекодирования
+                        "-movflags", "+faststart",
+                        str(output_file)
+                    ]
                 
                 logger.info(f"Экспорт сегмента {index + 1}/{total}: {output_filename}")
                 
@@ -335,8 +404,45 @@ class SegmentWorker:
         output_file: Path,
         progress_callback: Optional[Callable[[float, str], None]] = None
     ) -> bool:
-        """Быстрая склейка через concat demuxer."""
+        """Быстрая склейка через concat demuxer. Если сегменты требуют фильтров, использует точный режим."""
         import tempfile
+        
+        # Получаем информацию о видео
+        from app.ffprobe_utils import get_video_info
+        video_info = get_video_info(input_file)
+        input_width = video_info.get("width", 1920) if video_info else 1920
+        input_height = video_info.get("height", 1080) if video_info else 1080
+        
+        # Проверяем, нужно ли перекодирование для любого из сегментов
+        needs_reencoding = False
+        for segment in segments:
+            # Проверяем aspect ratio
+            current_aspect = input_width / input_height if input_height > 0 else 1.0
+            if segment.aspect_ratio == "16:9":
+                target_aspect = 16 / 9
+            elif segment.aspect_ratio == "9:16":
+                target_aspect = 9 / 16
+            else:
+                target_aspect = current_aspect
+            
+            if abs(current_aspect - target_aspect) >= 0.01:
+                needs_reencoding = True
+                break
+            
+            # Проверяем другие фильтры
+            if abs(segment.speed - 1.0) > 0.01:
+                needs_reencoding = True
+                break
+            if abs(segment.brightness) > 0.01 or abs(segment.contrast - 1.0) > 0.01 or \
+               abs(segment.saturation - 1.0) > 0.01 or abs(segment.sharpness) > 0.01 or \
+               abs(segment.shadows) > 0.01 or abs(segment.temperature) > 0.01 or abs(segment.tint) > 0.01:
+                needs_reencoding = True
+                break
+        
+        # Если нужно перекодирование, используем точный режим
+        if needs_reencoding:
+            logger.info("Обнаружены фильтры в сегментах, используем точный режим склейки")
+            return self._export_concat_accurate(input_file, segments, output_file, progress_callback)
         
         # Создаем временные файлы для каждого сегмента
         temp_dir = Path(tempfile.gettempdir()) / f"videocutter_concat_{int(time.time())}"

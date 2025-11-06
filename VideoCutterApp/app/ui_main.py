@@ -1439,7 +1439,8 @@ class MainWindow(QMainWindow):
         
         class SegmentExportThread(QThread):
             """Поток для экспорта сегментов."""
-            progress_updated = Signal(int, int, str)
+            progress_updated = Signal(int, int, str)  # current, total, message для split режима
+            progress_updated_float = Signal(float, str)  # progress (0.0-1.0), message для concat режима
             finished_signal = Signal(bool, str)
             
             def __init__(self, project: Project, fast_mode: bool, split_mode: bool):
@@ -1480,11 +1481,7 @@ class MainWindow(QMainWindow):
                             self.project.segments,
                             output_file,
                             fast_mode=self.fast_mode,
-                            progress_callback=lambda p, m: self.progress_updated.emit(
-                                int(p * len(self.project.segments)), 
-                                len(self.project.segments), 
-                                m
-                            )
+                            progress_callback=lambda p, m: self.progress_updated_float.emit(p, m)
                         )
                         
                         if success:
@@ -1524,12 +1521,39 @@ class MainWindow(QMainWindow):
             fast_mode,
             split_mode
         )
-        self.segment_export_thread.progress_updated.connect(
-            lambda c, t, m: self.update_progress(c * 100 // t if t > 0 else 0, m)
-        )
+        
+        # Подключаем сигналы для прогресса
+        def on_progress_updated(current: int, total: int, message: str):
+            """Обновляет прогресс для split режима."""
+            if hasattr(self, 'segments_widget'):
+                self.segments_widget.set_export_progress(current, total, message)
+            # Также обновляем основной прогресс-бар для совместимости
+            if total > 0:
+                progress_percent = int((current / total) * 100)
+                self.progress_bar.setValue(progress_percent)
+        
+        def on_progress_updated_float(progress: float, message: str):
+            """Обновляет прогресс для concat режима."""
+            if hasattr(self, 'segments_widget'):
+                progress_percent = int(progress * 100)
+                self.segments_widget.export_progress_bar.setValue(progress_percent)
+                if message:
+                    self.segments_widget.export_status_label.setText(f"{message} ({progress_percent}%)")
+                else:
+                    self.segments_widget.export_status_label.setText(f"Прогресс: {progress_percent}%")
+            # Также обновляем основной прогресс-бар
+            self.progress_bar.setValue(int(progress * 100))
+        
+        self.segment_export_thread.progress_updated.connect(on_progress_updated)
+        self.segment_export_thread.progress_updated_float.connect(on_progress_updated_float)
         self.segment_export_thread.finished_signal.connect(
             lambda success, msg: self.on_segment_export_finished(success, msg)
         )
+        
+        # Показываем прогресс-бар в виджете сегментов
+        if hasattr(self, 'segments_widget'):
+            self.segments_widget.show_export_progress(True)
+            self.segments_widget.export_btn.setEnabled(False)  # Отключаем кнопку во время экспорта
         
         self.process_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1539,6 +1563,11 @@ class MainWindow(QMainWindow):
     
     def on_segment_export_finished(self, success: bool, message: str):
         """Обработчик завершения экспорта сегментов."""
+        # Скрываем прогресс-бар и включаем кнопку экспорта
+        if hasattr(self, 'segments_widget'):
+            self.segments_widget.show_export_progress(False)
+            self.segments_widget.export_btn.setEnabled(True)
+        
         self.process_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
@@ -1546,6 +1575,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(100)
             QMessageBox.information(self, "Успех", message)
         else:
+            self.progress_bar.setValue(0)
             QMessageBox.critical(self, "Ошибка", message)
         
         self.log(message)
