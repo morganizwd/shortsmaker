@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QLineEdit, QProgressBar, QTextEdit, QMessageBox,
     QGroupBox, QSpinBox, QDoubleSpinBox, QComboBox, QSplitter, QSlider,
-    QStackedWidget
+    QStackedWidget, QTabWidget
 )
 from PySide6.QtGui import QRegion
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
@@ -17,7 +17,8 @@ from app.config import (
     ICON_PATH, DEFAULT_OUTPUT_DIR, ENCODING_PROFILES,
     DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT
 )
-from app.models import Job, FilterChain, Overlay
+from app.models import Job, FilterChain, Overlay, Segment, Project
+from typing import Optional
 from app.ffmpeg_worker import FFmpegWorker
 from app.ffprobe_utils import get_video_info
 from app.player_vlc import VLCPlayer
@@ -104,6 +105,9 @@ class MainWindow(QMainWindow):
         self.player = None  # Будет создан после video_widget
         self.preview_start_time = None  # Время начала для предпросмотра
         self.preview_end_time = None  # Время окончания для предпросмотра
+        self.current_project: Optional[Project] = None  # Проект многосегментного режима
+        self.temp_in_time: Optional[float] = None  # Временная метка In для создания сегмента
+        self.temp_out_time: Optional[float] = None  # Временная метка Out для создания сегмента
         
         self.init_ui()
         self.setup_connections()
@@ -244,6 +248,15 @@ class MainWindow(QMainWindow):
         
         # Инициализация плеера (будет настроен после показа окна)
         self.player = None
+        
+        # Создаем вкладки для переключения между режимами
+        self.mode_tabs = QTabWidget()
+        self.mode_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        
+        # Обычный режим (существующие элементы)
+        normal_mode_widget = QWidget()
+        normal_mode_layout = QVBoxLayout(normal_mode_widget)
+        normal_mode_layout.setContentsMargins(0, 0, 0, 0)
         
         # Группа выбора файла
         file_group = QGroupBox("Выбор видео файла")
@@ -447,18 +460,32 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
         
-        # Добавление в левую панель
-        left_layout.addWidget(file_group)
-        left_layout.addWidget(time_group)
-        left_layout.addWidget(output_group)
-        left_layout.addWidget(aspect_group)
-        left_layout.addWidget(color_group)
-        left_layout.addWidget(encoding_group)
-        left_layout.addWidget(self.progress_label)
-        left_layout.addWidget(self.progress_bar)
-        left_layout.addLayout(buttons_layout)
-        left_layout.addWidget(QLabel("Лог:"))
-        left_layout.addWidget(self.log_text)
+        # Добавление в обычный режим
+        normal_mode_layout.addWidget(file_group)
+        normal_mode_layout.addWidget(time_group)
+        normal_mode_layout.addWidget(output_group)
+        normal_mode_layout.addWidget(aspect_group)
+        normal_mode_layout.addWidget(color_group)
+        normal_mode_layout.addWidget(encoding_group)
+        normal_mode_layout.addWidget(self.progress_label)
+        normal_mode_layout.addWidget(self.progress_bar)
+        normal_mode_layout.addLayout(buttons_layout)
+        normal_mode_layout.addWidget(QLabel("Лог:"))
+        normal_mode_layout.addWidget(self.log_text)
+        normal_mode_layout.addStretch()
+        normal_mode_widget.setLayout(normal_mode_layout)
+        
+        # Многосегментный режим
+        from app.ui_segments import SegmentsModeWidget
+        self.segments_widget = SegmentsModeWidget()
+        self.segments_widget.setup_shortcuts(self)
+        
+        # Добавляем вкладки
+        self.mode_tabs.addTab(normal_mode_widget, "Обычный режим")
+        self.mode_tabs.addTab(self.segments_widget, "Многосегментный режим")
+        
+        # Добавление вкладок в левую панель
+        left_layout.addWidget(self.mode_tabs)
         left_panel.setLayout(left_layout)
         
         # Добавление панелей в splitter
@@ -510,6 +537,21 @@ class MainWindow(QMainWindow):
         # Элементы управления видео
         self.play_pause_btn.clicked.connect(self.toggle_play_pause)
         self.stop_btn_player.clicked.connect(self.stop_video_playback)
+        
+        # Подключение обработчиков многосегментного режима
+        if hasattr(self, 'segments_widget'):
+            self.segments_widget.set_in_btn.clicked.connect(self.segments_set_in)
+            self.segments_widget.set_out_btn.clicked.connect(self.segments_set_out)
+            self.segments_widget.add_segment_btn.clicked.connect(self.segments_add_clip)
+            self.segments_widget.delete_segment_btn.clicked.connect(self.segments_delete)
+            self.segments_widget.duplicate_segment_btn.clicked.connect(self.segments_duplicate)
+            self.segments_widget.save_project_btn.clicked.connect(self.segments_save_project)
+            self.segments_widget.load_project_btn.clicked.connect(self.segments_load_project)
+            self.segments_widget.export_btn.clicked.connect(self.segments_export)
+            self.segments_widget.timeline_widget.segment_clicked.connect(self.segments_on_click)
+            
+            # Обновление временной шкалы при изменении времени воспроизведения
+            self.position_timer.timeout.connect(self.segments_update_timeline)
         self.timeline_slider.sliderPressed.connect(self.on_slider_pressed)
         self.timeline_slider.sliderReleased.connect(self.on_slider_released)
         self.timeline_slider.valueChanged.connect(self.on_slider_value_changed)
@@ -559,6 +601,20 @@ class MainWindow(QMainWindow):
             
             # Обновляем размер виджета в соответствии с текущим соотношением сторон
             self._update_video_widget_size()
+            
+            # Обновляем многосегментный режим
+            if hasattr(self, 'segments_widget'):
+                self.segments_widget.set_video_duration(duration)
+                # Инициализируем проект, если его еще нет
+                if not self.current_project:
+                    output_dir = DEFAULT_OUTPUT_DIR / "segments"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    self.current_project = Project(
+                        input_file=video_path,
+                        output_dir=output_dir,
+                        project_name=video_path.stem
+                    )
+                    self.segments_widget.set_project(self.current_project)
             
             # Автоматически загружаем видео для предпросмотра
             if self.player and self.video_widget:
@@ -1179,4 +1235,318 @@ class MainWindow(QMainWindow):
         self.video_widget.setStyleSheet("background-color: black;")
         # Обновляем виджет, чтобы применить изменения
         self.video_widget.update()
+    
+    # Методы для многосегментного режима
+    def segments_set_in(self):
+        """Устанавливает метку In (начало сегмента)."""
+        if self.player:
+            current_time = self.player.get_time()
+            self.temp_in_time = current_time
+            # Обновляем визуализацию метки In на временной шкале
+            if hasattr(self, 'segments_widget'):
+                self.segments_widget.timeline_widget.set_in_marker(current_time)
+                # Обновляем текст кнопки для визуальной индикации
+                self.segments_widget.set_in_btn.setText(f"I - Set In ({seconds_to_timecode(current_time)})")
+            self.log(f"Установлена метка In: {seconds_to_timecode(current_time)}")
+    
+    def segments_set_out(self):
+        """Устанавливает метку Out (конец сегмента)."""
+        if self.player:
+            current_time = self.player.get_time()
+            self.temp_out_time = current_time
+            # Обновляем визуализацию метки Out на временной шкале
+            if hasattr(self, 'segments_widget'):
+                self.segments_widget.timeline_widget.set_out_marker(current_time)
+                # Обновляем текст кнопки для визуальной индикации
+                self.segments_widget.set_out_btn.setText(f"O - Set Out ({seconds_to_timecode(current_time)})")
+            self.log(f"Установлена метка Out: {seconds_to_timecode(current_time)}")
+    
+    def segments_add_clip(self):
+        """Добавляет новый сегмент из установленных меток In/Out."""
+        if not self.current_project:
+            # Создаем новый проект, если его нет
+            input_path = self.input_file_edit.text()
+            if not input_path:
+                QMessageBox.warning(self, "Ошибка", "Сначала выберите входной видео файл")
+                return
+            
+            output_dir = DEFAULT_OUTPUT_DIR / "segments"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.current_project = Project(
+                input_file=Path(input_path),
+                output_dir=output_dir,
+                project_name="New Project"
+            )
+            if hasattr(self, 'segments_widget'):
+                self.segments_widget.set_project(self.current_project)
+        
+        if self.temp_in_time is None or self.temp_out_time is None:
+            QMessageBox.warning(self, "Ошибка", "Установите метки In и Out (клавиши I и O)")
+            return
+        
+        start_time = min(self.temp_in_time, self.temp_out_time)
+        end_time = max(self.temp_in_time, self.temp_out_time)
+        
+        # Создаем новый сегмент с текущими настройками из обычного режима
+        segment = Segment(
+            start_time=start_time,
+            end_time=end_time,
+            name=f"Segment {len(self.current_project.segments) + 1}",
+            enabled=True,
+            encoding_profile=self.encoding_profile_combo.currentText(),
+            speed=self.speed_slider.value() / 10.0,
+            aspect_ratio=self.aspect_ratio_combo.currentText(),
+            brightness=(self.brightness_slider.value() - 100) / 100.0,
+            contrast=self.contrast_slider.value() / 100.0,
+            saturation=self.saturation_slider.value() / 100.0,
+            sharpness=self.sharpness_slider.value() / 100.0,
+            shadows=self.shadows_slider.value() / 100.0,
+            temperature=self.temperature_slider.value(),
+            tint=self.tint_slider.value()
+        )
+        
+        if self.current_project.add_segment(segment):
+            self.segments_widget.update_segments_table()
+            self.log(f"Добавлен сегмент: {seconds_to_timecode(start_time)} - {seconds_to_timecode(end_time)}")
+            # Сбрасываем метки и обновляем визуализацию
+            self.temp_in_time = None
+            self.temp_out_time = None
+            if hasattr(self, 'segments_widget'):
+                self.segments_widget.timeline_widget.set_in_marker(None)
+                self.segments_widget.timeline_widget.set_out_marker(None)
+                # Сбрасываем текст кнопок
+                self.segments_widget.set_in_btn.setText("I - Set In")
+                self.segments_widget.set_out_btn.setText("O - Set Out")
+        else:
+            QMessageBox.warning(self, "Ошибка", "Не удалось добавить сегмент")
+    
+    def segments_delete(self):
+        """Удаляет выбранный сегмент."""
+        if not self.current_project:
+            return
+        
+        selected_row = self.segments_widget.segments_table.currentRow()
+        if selected_row >= 0:
+            if self.current_project.remove_segment(selected_row):
+                self.segments_widget.update_segments_table()
+                self.log(f"Удален сегмент {selected_row + 1}")
+    
+    def segments_duplicate(self):
+        """Дублирует выбранный сегмент."""
+        if not self.current_project:
+            return
+        
+        selected_row = self.segments_widget.segments_table.currentRow()
+        if 0 <= selected_row < len(self.current_project.segments):
+            original = self.current_project.segments[selected_row]
+            # Создаем копию сегмента
+            from copy import deepcopy
+            duplicate = deepcopy(original)
+            duplicate.name = f"{original.name} (копия)"
+            if self.current_project.add_segment(duplicate):
+                self.segments_widget.update_segments_table()
+                self.log(f"Дублирован сегмент {selected_row + 1}")
+    
+    def segments_on_click(self, index: int):
+        """Обработчик клика по сегменту на временной шкале."""
+        if self.current_project and 0 <= index < len(self.current_project.segments):
+            segment = self.current_project.segments[index]
+            self.segments_widget.segments_table.selectRow(index)
+            # Перематываем к началу сегмента
+            if self.player:
+                self.player.set_time(segment.start_time)
+    
+    def segments_update_timeline(self):
+        """Обновляет временную шкалу сегментов при изменении времени воспроизведения."""
+        if hasattr(self, 'segments_widget') and self.player:
+            current_time = self.player.get_time()
+            self.segments_widget.set_current_time(current_time)
+    
+    def segments_save_project(self):
+        """Сохраняет проект в JSON файл."""
+        if not self.current_project:
+            QMessageBox.warning(self, "Ошибка", "Нет активного проекта для сохранения")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить проект",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if file_path:
+            if self.current_project.save_to_file(Path(file_path)):
+                self.log(f"Проект сохранен: {file_path}")
+                QMessageBox.information(self, "Успех", "Проект успешно сохранен")
+            else:
+                QMessageBox.critical(self, "Ошибка", "Не удалось сохранить проект")
+    
+    def segments_load_project(self):
+        """Загружает проект из JSON файла."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Загрузить проект",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if file_path:
+            project = Project.load_from_file(Path(file_path))
+            if project:
+                self.current_project = project
+                # Загружаем видео файл проекта
+                if project.input_file.exists():
+                    self.input_file_edit.setText(str(project.input_file))
+                    self.load_video_info(str(project.input_file))
+                else:
+                    QMessageBox.warning(self, "Предупреждение", 
+                                      f"Входной файл проекта не найден: {project.input_file}\n"
+                                      "Проект загружен, но файл необходимо выбрать вручную")
+                
+                # Обновляем UI
+                if hasattr(self, 'segments_widget'):
+                    self.segments_widget.set_project(project)
+                    if self.video_info:
+                        duration = self.video_info.get("duration", 0)
+                        self.segments_widget.set_video_duration(duration)
+                
+                self.log(f"Проект загружен: {file_path}")
+                QMessageBox.information(self, "Успех", "Проект успешно загружен")
+            else:
+                QMessageBox.critical(self, "Ошибка", "Не удалось загрузить проект")
+    
+    def segments_export(self):
+        """Экспортирует сегменты."""
+        if not self.current_project or not self.current_project.segments:
+            QMessageBox.warning(self, "Ошибка", "Нет сегментов для экспорта")
+            return
+        
+        enabled_segments = self.current_project.get_enabled_segments()
+        if not enabled_segments:
+            QMessageBox.warning(self, "Ошибка", "Нет включенных сегментов для экспорта")
+            return
+        
+        # Получаем настройки экспорта
+        export_mode = self.segments_widget.export_mode_combo.currentText()
+        export_method = self.segments_widget.export_method_combo.currentText()
+        
+        fast_mode = "Быстро" in export_method
+        split_mode = "Отдельные" in export_mode
+        
+        from app.segment_worker import SegmentWorker
+        from PySide6.QtCore import QThread, Signal
+        
+        class SegmentExportThread(QThread):
+            """Поток для экспорта сегментов."""
+            progress_updated = Signal(int, int, str)
+            finished_signal = Signal(bool, str)
+            
+            def __init__(self, project: Project, fast_mode: bool, split_mode: bool):
+                super().__init__()
+                self.project = project
+                self.fast_mode = fast_mode
+                self.split_mode = split_mode
+                self.worker = SegmentWorker(max_workers=4)
+            
+            def run(self):
+                try:
+                    if self.split_mode:
+                        # Экспорт отдельных файлов
+                        if self.fast_mode:
+                            output_files = self.worker.export_segments_fast(
+                                self.project.input_file,
+                                self.project.segments,
+                                self.project.output_dir,
+                                progress_callback=lambda c, t, m: self.progress_updated.emit(c, t, m)
+                            )
+                        else:
+                            output_files = self.worker.export_segments_accurate(
+                                self.project.input_file,
+                                self.project.segments,
+                                self.project.output_dir,
+                                progress_callback=lambda c, t, m: self.progress_updated.emit(c, t, m)
+                            )
+                        
+                        if output_files:
+                            self.finished_signal.emit(True, f"Экспортировано {len(output_files)} файлов")
+                        else:
+                            self.finished_signal.emit(False, "Ошибка экспорта сегментов")
+                    else:
+                        # Экспорт склейки
+                        output_file = self.project.output_dir / "concatenated.mp4"
+                        success = self.worker.export_concat(
+                            self.project.input_file,
+                            self.project.segments,
+                            output_file,
+                            fast_mode=self.fast_mode,
+                            progress_callback=lambda p, m: self.progress_updated.emit(
+                                int(p * len(self.project.segments)), 
+                                len(self.project.segments), 
+                                m
+                            )
+                        )
+                        
+                        if success:
+                            self.finished_signal.emit(True, f"Склейка завершена: {output_file}")
+                        else:
+                            self.finished_signal.emit(False, "Ошибка склейки сегментов")
+                except Exception as e:
+                    self.finished_signal.emit(False, f"Ошибка: {str(e)}")
+        
+        # Выбор директории для экспорта (если режим Split)
+        if split_mode:
+            output_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Выберите директорию для экспорта",
+                str(self.current_project.output_dir)
+            )
+            if output_dir:
+                self.current_project.output_dir = Path(output_dir)
+            else:
+                return
+        else:
+            # Режим склейки - выбираем выходной файл
+            output_file, _ = QFileDialog.getSaveFileName(
+                self,
+                "Сохранить склеенное видео",
+                str(self.current_project.output_dir / "concatenated.mp4"),
+                "Video Files (*.mp4);;All Files (*)"
+            )
+            if output_file:
+                self.current_project.output_dir = Path(output_file).parent
+            else:
+                return
+        
+        # Запускаем экспорт в отдельном потоке
+        self.segment_export_thread = SegmentExportThread(
+            self.current_project,
+            fast_mode,
+            split_mode
+        )
+        self.segment_export_thread.progress_updated.connect(
+            lambda c, t, m: self.update_progress(c * 100 // t if t > 0 else 0, m)
+        )
+        self.segment_export_thread.finished_signal.connect(
+            lambda success, msg: self.on_segment_export_finished(success, msg)
+        )
+        
+        self.process_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.log(f"Начало экспорта: {export_mode}, метод: {export_method}")
+        self.segment_export_thread.start()
+    
+    def on_segment_export_finished(self, success: bool, message: str):
+        """Обработчик завершения экспорта сегментов."""
+        self.process_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        
+        if success:
+            self.progress_bar.setValue(100)
+            QMessageBox.information(self, "Успех", message)
+        else:
+            QMessageBox.critical(self, "Ошибка", message)
+        
+        self.log(message)
 
