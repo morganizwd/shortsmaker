@@ -214,8 +214,13 @@ class MainWindow(QMainWindow):
         buttons_controls_layout = QHBoxLayout()
         self.play_pause_btn = QPushButton("▶ Воспроизвести")
         self.stop_btn_player = QPushButton("⏹ Остановить")
+        self.frame_back_btn = QPushButton("⏮ Кадр назад")
+        self.frame_forward_btn = QPushButton("Кадр вперед ⏭")
+        
         buttons_controls_layout.addWidget(self.play_pause_btn)
         buttons_controls_layout.addWidget(self.stop_btn_player)
+        buttons_controls_layout.addWidget(self.frame_back_btn)
+        buttons_controls_layout.addWidget(self.frame_forward_btn)
         buttons_controls_layout.addStretch()
         controls_layout.addLayout(buttons_controls_layout)
         
@@ -548,6 +553,8 @@ class MainWindow(QMainWindow):
         # Элементы управления видео
         self.play_pause_btn.clicked.connect(self.toggle_play_pause)
         self.stop_btn_player.clicked.connect(self.stop_video_playback)
+        self.frame_back_btn.clicked.connect(self.on_frame_back_clicked)
+        self.frame_forward_btn.clicked.connect(self.on_frame_forward_clicked)
         
         # Подключение обработчиков многосегментного режима
         if hasattr(self, 'segments_widget'):
@@ -657,10 +664,12 @@ class MainWindow(QMainWindow):
             if self.video_info:
                 width = self.video_info.get("width", 1920)
                 height = self.video_info.get("height", 1080)
+                fps = self.video_info.get("fps", 30.0)
                 aspect_ratio = self.aspect_ratio_combo.currentText()
-                # Сохраняем размеры в плеере для использования в play_file
+                # Сохраняем размеры и FPS в плеере для использования в play_file
                 self.player.video_width = width
                 self.player.video_height = height
+                self.player.video_fps = fps
                 self.player.aspect_ratio = aspect_ratio
             
             # Загружаем видео без ограничения по времени (без автоматического воспроизведения)
@@ -778,10 +787,12 @@ class MainWindow(QMainWindow):
         if self.video_info:
             width = self.video_info.get("width", 1920)
             height = self.video_info.get("height", 1080)
+            fps = self.video_info.get("fps", 30.0)
             aspect_ratio = self.aspect_ratio_combo.currentText()
-            # Сохраняем размеры в плеере для использования в play_file
+            # Сохраняем размеры и FPS в плеере для использования в play_file
             self.player.video_width = width
             self.player.video_height = height
+            self.player.video_fps = fps
             self.player.aspect_ratio = aspect_ratio
         
         # Загружаем видео с указанным диапазоном
@@ -942,6 +953,20 @@ class MainWindow(QMainWindow):
         self.position_timer.stop()
         self.timeline_slider.setValue(0)
         self.time_label.setText("00:00:00.000 / " + self.time_label.text().split(" / ")[-1])
+    
+    def on_frame_back_clicked(self):
+        """Обработчик нажатия кнопки перемотки на кадр назад."""
+        if self.player:
+            self.player.previous_frame()
+            # Обновляем позицию слайдера и метку времени
+            QTimer.singleShot(50, self.update_video_position)
+    
+    def on_frame_forward_clicked(self):
+        """Обработчик нажатия кнопки перемотки на кадр вперед."""
+        if self.player:
+            self.player.next_frame()
+            # Обновляем позицию слайдера и метку времени
+            QTimer.singleShot(50, self.update_video_position)
     
     def update_video_position(self):
         """Обновление позиции слайдера во время воспроизведения."""

@@ -508,6 +508,99 @@ class VLCPlayer:
                 return 0.0
         return 0.0
     
+    def get_fps(self) -> float:
+        """Получает FPS текущего видео."""
+        # Используем сохраненное значение FPS, если оно есть
+        if hasattr(self, 'video_fps') and self.video_fps > 0:
+            return self.video_fps
+        
+        if self.player:
+            try:
+                # Пытаемся получить FPS из медиа
+                media = self.player.get_media()
+                if media:
+                    # Парсим FPS из медиа
+                    fps = media.get_meta(vlc.Meta.FPS)
+                    if fps:
+                        try:
+                            return float(fps)
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Альтернативный способ - через tracks
+                tracks = self.player.video_get_tracks()
+                if tracks:
+                    for track in tracks:
+                        if hasattr(track, 'f_fps') and track.f_fps > 0:
+                            return track.f_fps
+                
+                # Если не удалось получить, возвращаем дефолтное значение
+                return 30.0  # Дефолтный FPS
+            except Exception as e:
+                logger.debug(f"Ошибка получения FPS: {e}")
+                return 30.0
+        return 30.0
+    
+    def next_frame(self) -> bool:
+        """Перематывает на один кадр вперед."""
+        if not self.player:
+            return False
+        
+        try:
+            # Получаем текущее время
+            current_time = self.get_time()
+            
+            # Получаем FPS для расчета длительности кадра
+            fps = self.get_fps()
+            frame_duration = 1.0 / fps if fps > 0 else 1.0 / 30.0
+            
+            # Перематываем на один кадр вперед
+            new_time = current_time + frame_duration
+            
+            # Убеждаемся, что видео на паузе для точной перемотки
+            was_playing = self.player.is_playing()
+            if was_playing:
+                self.player.pause()
+            
+            # Устанавливаем новое время
+            self.set_time(new_time)
+            
+            logger.debug(f"Перемотка на кадр вперед: {current_time:.3f}s -> {new_time:.3f}s (FPS: {fps:.2f})")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка перемотки на кадр вперед: {e}")
+            return False
+    
+    def previous_frame(self) -> bool:
+        """Перематывает на один кадр назад."""
+        if not self.player:
+            return False
+        
+        try:
+            # Получаем текущее время
+            current_time = self.get_time()
+            
+            # Получаем FPS для расчета длительности кадра
+            fps = self.get_fps()
+            frame_duration = 1.0 / fps if fps > 0 else 1.0 / 30.0
+            
+            # Перематываем на один кадр назад
+            new_time = max(0.0, current_time - frame_duration)
+            
+            # Убеждаемся, что видео на паузе для точной перемотки
+            was_playing = self.player.is_playing()
+            if was_playing:
+                self.player.pause()
+            
+            # Устанавливаем новое время
+            self.set_time(new_time)
+            
+            logger.debug(f"Перемотка на кадр назад: {current_time:.3f}s -> {new_time:.3f}s (FPS: {fps:.2f})")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка перемотки на кадр назад: {e}")
+            return False
+    
     def set_time(self, time: float):
         """Устанавливает время воспроизведения в секундах."""
         if self.player:
