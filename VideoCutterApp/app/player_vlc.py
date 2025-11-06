@@ -6,6 +6,7 @@ import sys
 import vlc
 import tempfile
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 from PySide6.QtCore import QTimer, QThread, Signal
@@ -28,6 +29,7 @@ class VLCPlayer:
         self.instance: Optional[vlc.Instance] = None
         self.player: Optional[vlc.MediaPlayer] = None
         self.current_file: Optional[Path] = None
+        self.original_file: Optional[Path] = None  # Оригинальный файл (не временный предпросмотр)
         self.start_time: float = 0.0
         self.end_time: float = 0.0
         self.video_widget = video_widget
@@ -44,17 +46,21 @@ class VLCPlayer:
         self.hue: float = 0.0  # Используется для тона (tint)
         self.gamma: float = 1.0  # Используется для теней (shadows)
         self.sharpness: float = 0.0
+        self.shadows: float = 0.0  # Сохраняем значение shadows для fallback
         self.temperature: float = 0.0
         self.tint: float = 0.0
         
         # Для предпросмотра с FFmpeg фильтрами
-        self.use_ffmpeg_preview: bool = False  # Использовать FFmpeg для предпросмотра (по умолчанию выключено из-за медленности)
+        # По умолчанию выключено из-за медленности и проблем с производительностью
+        # Можно включить для точного соответствия рендеру, но это будет медленнее
+        self.use_ffmpeg_preview: bool = False  # Использовать FFmpeg для предпросмотра (медленно, но точно)
         self.preview_temp_file: Optional[Path] = None
         self.ffmpeg_worker = FFmpegWorker()
         self._preview_update_timer = QTimer()
         self._preview_update_timer.setSingleShot(True)
         self._preview_update_timer.timeout.connect(self._update_preview_debounced)
         self._pending_color_params = None  # Параметры для отложенного обновления
+        self._preview_thread: Optional[QThread] = None  # Текущий поток создания предпросмотра
         
         try:
             # Создаем instance с опциями для поддержки фильтров
@@ -251,6 +257,9 @@ class VLCPlayer:
         
         try:
             self.current_file = file_path
+            # Сохраняем оригинальный файл, если это не временный предпросмотр
+            if "videocutter_preview_" not in str(file_path):
+                self.original_file = file_path
             self.start_time = start_time
             self.end_time = end_time
             
@@ -477,13 +486,44 @@ class VLCPlayer:
     def get_time(self) -> float:
         """Получает текущее время воспроизведения в секундах."""
         if self.player:
-            return self.player.get_time() / 1000.0
+            try:
+                time_ms = self.player.get_time()
+                if time_ms < 0:
+                    return 0.0
+                time_seconds = time_ms / 1000.0
+                # Если используется временный файл предпросмотра, пересчитываем позицию относительно оригинального файла
+                if self.original_file and self.current_file and "videocutter_preview_" in str(self.current_file):
+                    # Временный файл начинается с start_time оригинального файла
+                    return time_seconds + self.start_time
+                return time_seconds
+            except Exception as e:
+                logger.debug(f"Ошибка получения времени: {e}")
+                return 0.0
         return 0.0
     
     def set_time(self, time: float):
         """Устанавливает время воспроизведения в секундах."""
         if self.player:
-            self.player.set_time(int(time * 1000))
+            # Убеждаемся, что время не отрицательное
+            time = max(0.0, time)
+            # Если используется временный файл предпросмотра, пересчитываем позицию
+            if self.original_file and "videocutter_preview_" in str(self.current_file):
+                # Позиция в временном файле = time - start_time
+                preview_time = max(0.0, time - self.start_time)
+                time = preview_time
+            
+            # Проверяем, что видео загружено и готово
+            try:
+                state = self.player.get_state()
+                if state in (vlc.State.Playing, vlc.State.Paused, vlc.State.Stopped):
+                    self.player.set_time(int(time * 1000))
+                else:
+                    # Если видео еще не готово, используем задержку
+                    QTimer.singleShot(100, lambda: self.player.set_time(int(time * 1000)) if self.player else None)
+            except Exception as e:
+                logger.debug(f"Ошибка установки времени: {e}")
+                # Пробуем еще раз через задержку
+                QTimer.singleShot(200, lambda: self.player.set_time(int(time * 1000)) if self.player else None)
     
     def is_playing(self) -> bool:
         """Проверяет, воспроизводится ли видео."""
@@ -505,7 +545,22 @@ class VLCPlayer:
     def get_length(self) -> float:
         """Получает длительность в секундах."""
         if self.player:
-            return self.player.get_length() / 1000.0
+            try:
+                length_ms = self.player.get_length()
+                if length_ms <= 0:
+                    return 0.0
+                length_seconds = length_ms / 1000.0
+                # Если используется временный файл предпросмотра, возвращаем длительность оригинального файла
+                if self.original_file and self.current_file and "videocutter_preview_" in str(self.current_file):
+                    # Для временного файла нужно вернуть длительность оригинального файла
+                    # Используем end_time если он установлен, иначе длительность временного файла + start_time
+                    if self.end_time > self.start_time:
+                        return self.end_time - self.start_time
+                    return length_seconds + self.start_time
+                return length_seconds
+            except Exception as e:
+                logger.debug(f"Ошибка получения длительности: {e}")
+                return 0.0
         return 0.0
     
     def set_rate(self, rate: float):
@@ -628,7 +683,9 @@ class VLCPlayer:
         params = self._pending_color_params
         self._pending_color_params = None
         
-        if not self.current_file or not self.current_file.exists():
+        # Используем оригинальный файл для создания предпросмотра, если он есть
+        input_file = self.original_file if self.original_file and self.original_file.exists() else self.current_file
+        if not input_file or not input_file.exists():
             return
         
         # Получаем текущую скорость
@@ -643,22 +700,47 @@ class VLCPlayer:
             else:
                 preview_end_time = self.start_time + 10.0
         
-        # Удаляем старый временный файл, если он существует
-        if self.preview_temp_file and self.preview_temp_file.exists():
-            try:
-                self.preview_temp_file.unlink()
-            except:
-                pass
+        # Останавливаем воспроизведение перед удалением старого файла
+        was_playing = self.is_playing()
+        if was_playing:
+            self.stop()
         
-        # Создаем новый временный файл
+        # Ждем, пока VLC освободит файл
+        if self.preview_temp_file and self.preview_temp_file.exists():
+            # Пробуем удалить файл с несколькими попытками
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                try:
+                    # Даем задержку перед каждой попыткой
+                    time.sleep(0.2)
+                    self.preview_temp_file.unlink()
+                    logger.debug(f"Старый файл предпросмотра удален: {self.preview_temp_file}")
+                    break
+                except Exception as e:
+                    if attempt < max_attempts - 1:
+                        logger.debug(f"Попытка {attempt + 1}/{max_attempts} удаления файла не удалась, повторяю...")
+                    else:
+                        logger.warning(f"Не удалось удалить старый файл предпросмотра после {max_attempts} попыток: {e}")
+                        # Если не удалось удалить, просто пропускаем - новый файл будет с другим именем
+        
+        # Создаем новый временный файл с уникальным именем (добавляем timestamp)
         temp_dir = tempfile.gettempdir()
-        temp_file = Path(temp_dir) / f"videocutter_preview_{id(self)}.mp4"
+        timestamp = int(time.time() * 1000)  # Миллисекунды для уникальности
+        temp_file = Path(temp_dir) / f"videocutter_preview_{id(self)}_{timestamp}.mp4"
         self.preview_temp_file = temp_file
+        
+        # Останавливаем предыдущий поток, если он еще работает
+        if self._preview_thread and self._preview_thread.isRunning():
+            logger.debug("Отменяем предыдущий поток создания предпросмотра")
+            self._preview_thread.terminate()
+            if not self._preview_thread.wait(2000):  # Ждем до 2 секунд
+                logger.warning("Предыдущий поток не завершился вовремя, принудительно завершаем")
+                self._preview_thread.terminate()
         
         # Создаем поток для создания предпросмотра
         self._preview_thread = self.PreviewThread(
             self.ffmpeg_worker,
-            self.current_file,
+            input_file,  # Используем оригинальный файл, а не текущий (который может быть временным)
             self.start_time,
             preview_end_time,
             params['brightness'],
@@ -683,19 +765,36 @@ class VLCPlayer:
         if preview_file and preview_file.exists():
             # Воспроизводим временный файл
             was_playing = self.is_playing()
-            current_pos = self.get_time()
+            # Сохраняем позицию относительно оригинального файла
+            original_pos = self.get_time()
             
             # Останавливаем текущее воспроизведение
             self.stop()
             
-            # Загружаем новый файл
+            # Загружаем новый файл (временный предпросмотр начинается с 0)
             self.play_file(preview_file, 0.0, 0.0)
             
-            # Восстанавливаем позицию и состояние воспроизведения
-            if current_pos > 0:
-                QTimer.singleShot(500, lambda: self.set_time(current_pos))
+            # Восстанавливаем позицию относительно временного файла
+            # Временный файл начинается с start_time оригинального файла
+            # Поэтому позиция в временном файле = original_pos - start_time
+            if original_pos > 0 and self.start_time >= 0:
+                preview_pos = max(0.0, original_pos - self.start_time)
+                # Используем несколько попыток для установки позиции
+                def set_pos_retry(attempt=0):
+                    if attempt < 5 and self.player:
+                        try:
+                            state = self.player.get_state()
+                            if state in (vlc.State.Playing, vlc.State.Paused, vlc.State.Stopped):
+                                self.set_time(preview_pos)
+                            elif attempt < 4:
+                                QTimer.singleShot(200, lambda: set_pos_retry(attempt + 1))
+                        except:
+                            if attempt < 4:
+                                QTimer.singleShot(200, lambda: set_pos_retry(attempt + 1))
+                QTimer.singleShot(300, lambda: set_pos_retry())
+            
             if was_playing:
-                QTimer.singleShot(600, lambda: self.play())
+                QTimer.singleShot(500, lambda: self.play() if self.player else None)
             
             # ВАЖНО: Отключаем video_adjust, чтобы не "удваивать" коррекцию
             try:
@@ -749,6 +848,7 @@ class VLCPlayer:
         self.contrast = contrast
         self.saturation = saturation
         self.sharpness = sharpness
+        self.shadows = shadows  # Сохраняем shadows для fallback
         self.temperature = temperature
         self.tint = tint
         
@@ -775,7 +875,8 @@ class VLCPlayer:
             }
             # Перезапускаем таймер (debounce: обновляем только после остановки движения слайдера)
             self._preview_update_timer.stop()
-            self._preview_update_timer.start(500)  # 500мс задержка
+            # Увеличиваем задержку до 1.5 секунд для уменьшения нагрузки
+            self._preview_update_timer.start(1500)  # 1.5 секунды задержка
             return
         
         # Иначе используем стандартный метод VLC
@@ -889,6 +990,15 @@ class VLCPlayer:
     
     def release(self):
         """Освобождает ресурсы."""
+        # Останавливаем таймер
+        if hasattr(self, '_preview_update_timer'):
+            self._preview_update_timer.stop()
+        
+        # Останавливаем поток создания предпросмотра, если он работает
+        if hasattr(self, '_preview_thread') and self._preview_thread and self._preview_thread.isRunning():
+            self._preview_thread.terminate()
+            self._preview_thread.wait(2000)  # Ждем до 2 секунд
+        
         if self.player:
             self.player.stop()
             self.player.release()

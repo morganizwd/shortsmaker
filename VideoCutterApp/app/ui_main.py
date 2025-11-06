@@ -139,9 +139,12 @@ class MainWindow(QMainWindow):
         # Виджет для видео с поддержкой масштабирования
         # Используем QWidget для встраивания VLC
         self.video_widget = QWidget()
-        self.video_widget.setMinimumSize(640, 360)
+        self.video_widget.setMinimumSize(320, 180)  # Минимальный размер для маленьких окон
+        # Разрешаем виджету расширяться
+        from PySide6.QtWidgets import QSizePolicy
+        self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_widget.setStyleSheet("background-color: black;")
-        video_layout.addWidget(self.video_widget)
+        video_layout.addWidget(self.video_widget, stretch=1)  # Добавляем stretch для расширения
         
         # Элементы управления воспроизведением
         controls_layout = QVBoxLayout()
@@ -355,6 +358,13 @@ class MainWindow(QMainWindow):
         tint_layout.addWidget(self.tint_value_label)
         color_layout.addLayout(tint_layout)
         
+        # Кнопка сброса параметров
+        reset_layout = QHBoxLayout()
+        reset_layout.addStretch()
+        self.reset_color_btn = QPushButton("Сбросить к значениям по умолчанию")
+        reset_layout.addWidget(self.reset_color_btn)
+        color_layout.addLayout(reset_layout)
+        
         color_group.setLayout(color_layout)
         
         # Группа профиля кодирования
@@ -453,6 +463,9 @@ class MainWindow(QMainWindow):
         self.shadows_slider.valueChanged.connect(lambda v: self.on_color_slider_changed('shadows', v, -100, 100))
         self.temperature_slider.valueChanged.connect(self.on_temperature_changed)
         self.tint_slider.valueChanged.connect(self.on_tint_changed)
+        
+        # Кнопка сброса параметров цветокоррекции
+        self.reset_color_btn.clicked.connect(self.reset_color_correction)
     
     def log(self, message: str):
         """Добавляет сообщение в лог."""
@@ -865,12 +878,19 @@ class MainWindow(QMainWindow):
         
         # Устанавливаем позицию в плеере
         was_playing = self.player.is_playing()
-        self.player.set_time(position_seconds)
+        
+        # Если используется временный файл предпросмотра, нужно пересчитать позицию относительно оригинального файла
+        # Но для простоты просто устанавливаем позицию напрямую
+        try:
+            self.player.set_time(position_seconds)
+        except Exception as e:
+            logger.error(f"Ошибка установки времени: {e}")
         
         # Если было воспроизведение, продолжаем (но только если не вышли за пределы диапазона)
         if was_playing:
             if (self.preview_end_time is None or position_seconds < self.preview_end_time):
-                self.player.play()  # Используем play() вместо resume() для надежности
+                # Используем небольшую задержку перед возобновлением воспроизведения
+                QTimer.singleShot(100, lambda: self.player.play() if self.player else None)
                 self.play_pause_btn.setText("⏸ Пауза")
             else:
                 self.player.stop()
@@ -997,6 +1017,58 @@ class MainWindow(QMainWindow):
                 tint=tint
             )
     
+    def reset_color_correction(self):
+        """Сбрасывает все параметры цветокоррекции к значениям по умолчанию."""
+        # Временно отключаем сигналы, чтобы избежать множественных обновлений
+        self.brightness_slider.blockSignals(True)
+        self.contrast_slider.blockSignals(True)
+        self.saturation_slider.blockSignals(True)
+        self.sharpness_slider.blockSignals(True)
+        self.shadows_slider.blockSignals(True)
+        self.temperature_slider.blockSignals(True)
+        self.tint_slider.blockSignals(True)
+        
+        # Сбрасываем все слайдеры к значениям по умолчанию
+        self.brightness_slider.setValue(100)  # 0.0
+        self.contrast_slider.setValue(100)  # 1.0
+        self.saturation_slider.setValue(100)  # 1.0
+        self.sharpness_slider.setValue(0)  # 0.0
+        self.shadows_slider.setValue(0)  # 0.0
+        self.temperature_slider.setValue(0)  # 0
+        self.tint_slider.setValue(0)  # 0
+        
+        # Обновляем метки значений
+        self.brightness_value_label.setText("0.0")
+        self.contrast_value_label.setText("1.0")
+        self.saturation_value_label.setText("1.0")
+        self.sharpness_value_label.setText("0.0")
+        self.shadows_value_label.setText("0.0")
+        self.temperature_value_label.setText("0")
+        self.tint_value_label.setText("0")
+        
+        # Включаем сигналы обратно
+        self.brightness_slider.blockSignals(False)
+        self.contrast_slider.blockSignals(False)
+        self.saturation_slider.blockSignals(False)
+        self.sharpness_slider.blockSignals(False)
+        self.shadows_slider.blockSignals(False)
+        self.temperature_slider.blockSignals(False)
+        self.tint_slider.blockSignals(False)
+        
+        # Применяем сброс к предпросмотру (если видео загружено)
+        if self.player:
+            self.player.set_color_correction(
+                brightness=0.0,
+                contrast=1.0,
+                saturation=1.0,
+                sharpness=0.0,
+                shadows=0.0,
+                temperature=0.0,
+                tint=0.0
+            )
+        
+        self.log("Параметры цветокоррекции сброшены к значениям по умолчанию")
+    
     def on_aspect_ratio_changed(self, aspect_ratio: str):
         """Обработчик изменения соотношения сторон."""
         # Обновляем размер виджета видео для предпросмотра
@@ -1020,26 +1092,26 @@ class MainWindow(QMainWindow):
                     self.player.pause()
     
     def _update_video_widget_size(self, aspect_ratio: str = None):
-        """Обновляет размер виджета видео в соответствии с соотношением сторон."""
+        """Обновляет минимальный размер виджета видео в соответствии с соотношением сторон."""
         if not self.video_widget:
             return
         
         if aspect_ratio is None:
             aspect_ratio = self.aspect_ratio_combo.currentText()
         
-        # Используем фиксированные размеры для предпросмотра
-        # Виджет будет масштабировать видео для заполнения
+        # Устанавливаем только минимальный размер для сохранения соотношения сторон
+        # Виджет может расширяться, но сохраняет минимальное соотношение сторон
         if aspect_ratio == "9:16":
-            # Вертикальное видео - используем вертикальный виджет
-            new_width = 360  # Уже для вертикального видео
-            new_height = 640  # Высота для вертикального видео
+            # Вертикальное видео - минимальный размер
+            min_width = 180
+            min_height = 320
         else:  # 16:9
-            # Горизонтальное видео
-            new_width = 640
-            new_height = 360
+            # Горизонтальное видео - минимальный размер
+            min_width = 320
+            min_height = 180
         
-        self.video_widget.setMinimumSize(new_width, new_height)
-        self.video_widget.setMaximumSize(new_width, new_height)
+        self.video_widget.setMinimumSize(min_width, min_height)
+        # НЕ устанавливаем максимальный размер - виджет может расширяться
         # Устанавливаем стиль для масштабирования содержимого
         self.video_widget.setStyleSheet("background-color: black;")
         # Обновляем виджет, чтобы применить изменения
