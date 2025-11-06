@@ -7,7 +7,8 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QLineEdit, QProgressBar, QTextEdit, QMessageBox,
-    QGroupBox, QSpinBox, QDoubleSpinBox, QComboBox, QSplitter, QSlider
+    QGroupBox, QSpinBox, QDoubleSpinBox, QComboBox, QSplitter, QSlider,
+    QStackedWidget
 )
 from PySide6.QtGui import QRegion
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
@@ -136,6 +137,11 @@ class MainWindow(QMainWindow):
         video_group = QGroupBox("Предпросмотр видео")
         video_layout = QVBoxLayout()
         
+        # Контейнер для видео и индикатора загрузки
+        video_container = QWidget()
+        video_container_layout = QVBoxLayout(video_container)
+        video_container_layout.setContentsMargins(0, 0, 0, 0)
+        
         # Виджет для видео с поддержкой масштабирования
         # Используем QWidget для встраивания VLC
         self.video_widget = QWidget()
@@ -144,7 +150,46 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QSizePolicy
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_widget.setStyleSheet("background-color: black;")
-        video_layout.addWidget(self.video_widget, stretch=1)  # Добавляем stretch для расширения
+        
+        # Индикатор загрузки (скрыт по умолчанию)
+        self.preview_loading_widget = QWidget()
+        self.preview_loading_widget.setStyleSheet("background-color: rgba(0, 0, 0, 200);")
+        loading_layout = QVBoxLayout(self.preview_loading_widget)
+        loading_layout.setAlignment(Qt.AlignCenter)
+        
+        self.preview_loading_label = QLabel("Создание предпросмотра...")
+        self.preview_loading_label.setStyleSheet("color: white; font-size: 16px; font-weight: bold;")
+        self.preview_loading_label.setAlignment(Qt.AlignCenter)
+        
+        self.preview_loading_progress = QProgressBar()
+        self.preview_loading_progress.setRange(0, 0)  # Неопределенный прогресс
+        self.preview_loading_progress.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid white;
+                border-radius: 5px;
+                text-align: center;
+                color: white;
+                background-color: rgba(255, 255, 255, 50);
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 3px;
+            }
+        """)
+        self.preview_loading_progress.setFixedWidth(200)
+        self.preview_loading_progress.setFixedHeight(20)
+        
+        loading_layout.addWidget(self.preview_loading_label)
+        loading_layout.addWidget(self.preview_loading_progress, alignment=Qt.AlignCenter)
+        
+        # Используем QStackedWidget для переключения между видео и индикатором
+        self.video_stack = QStackedWidget()
+        self.video_stack.addWidget(self.video_widget)
+        self.video_stack.addWidget(self.preview_loading_widget)
+        self.video_stack.setCurrentWidget(self.video_widget)  # По умолчанию показываем видео
+        
+        video_container_layout.addWidget(self.video_stack, stretch=1)
+        video_layout.addWidget(video_container, stretch=1)  # Добавляем stretch для расширения
         
         # Элементы управления воспроизведением
         controls_layout = QVBoxLayout()
@@ -432,7 +477,22 @@ class MainWindow(QMainWindow):
     def _init_player(self):
         """Инициализирует VLC плеер после того, как виджет будет виден."""
         if self.video_widget is not None:
-            self.player = VLCPlayer(self.video_widget)
+            # Создаем callback функции для показа/скрытия индикатора загрузки
+            def show_preview_loading():
+                """Показывает индикатор загрузки."""
+                if hasattr(self, 'video_stack'):
+                    self.video_stack.setCurrentWidget(self.preview_loading_widget)
+            
+            def hide_preview_loading():
+                """Скрывает индикатор загрузки."""
+                if hasattr(self, 'video_stack'):
+                    self.video_stack.setCurrentWidget(self.video_widget)
+            
+            self.player = VLCPlayer(
+                self.video_widget,
+                on_preview_start=show_preview_loading,
+                on_preview_end=hide_preview_loading
+            )
             # Убеждаемся, что виджет правильно настроен
             if self.player:
                 self.player.set_video_widget(self.video_widget)
@@ -529,8 +589,8 @@ class MainWindow(QMainWindow):
                 self.player.video_height = height
                 self.player.aspect_ratio = aspect_ratio
             
-            # Загружаем видео без ограничения по времени
-            self.player.play_file(video_path, 0.0, 0.0)  # 0.0 означает до конца
+            # Загружаем видео без ограничения по времени (без автоматического воспроизведения)
+            self.player.play_file(video_path, 0.0, 0.0, auto_play=False)  # 0.0 означает до конца
             
             # Применяем текущие настройки цветокоррекции после загрузки
             QTimer.singleShot(300, lambda: self._apply_color_correction_to_preview())
@@ -541,8 +601,9 @@ class MainWindow(QMainWindow):
             # Обновляем метку времени
             length_str = seconds_to_timecode(duration)
             self.time_label.setText(f"00:00:00.000 / {length_str}")
-            # Автоматически ставим на паузу после загрузки
-            QTimer.singleShot(500, lambda: self._pause_after_load())
+            # Устанавливаем кнопку в состояние "Воспроизвести" (видео уже загружено, но не играет)
+            # и запускаем обновление позиции
+            QTimer.singleShot(300, lambda: self._setup_after_load())
     
     def _apply_color_correction_to_preview(self):
         """Применяет текущие настройки цветокоррекции к предпросмотру."""
@@ -567,12 +628,14 @@ class MainWindow(QMainWindow):
             tint=tint
         )
     
-    def _pause_after_load(self):
-        """Ставит видео на паузу после загрузки."""
+    def _setup_after_load(self):
+        """Настраивает UI после загрузки видео (без автоматического воспроизведения)."""
         if self.player:
-            self.player.pause()
+            # Убеждаемся, что видео на паузе (play_file не запускает воспроизведение)
+            if self.player.is_playing():
+                self.player.pause()
             self.play_pause_btn.setText("▶ Воспроизвести")
-            # Начинаем обновление позиции только после паузы
+            # Начинаем обновление позиции
             self.position_timer.start(100)
     
     def auto_set_output_path(self, input_path: str):

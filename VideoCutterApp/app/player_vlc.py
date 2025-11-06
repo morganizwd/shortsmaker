@@ -1,4 +1,4 @@
-"""
+﻿"""
 Воспроизведение видео через VLC (предпросмотр).
 """
 
@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 class VLCPlayer:
     """Класс для воспроизведения видео через VLC."""
     
-    def __init__(self, video_widget=None):
+    def __init__(self, video_widget=None, on_preview_start=None, on_preview_end=None):
         """
         Инициализация VLC плеера.
         
@@ -33,6 +33,8 @@ class VLCPlayer:
         self.start_time: float = 0.0
         self.end_time: float = 0.0
         self.video_widget = video_widget
+        self.on_preview_start = on_preview_start
+        self.on_preview_end = on_preview_end
         self.end_timer = QTimer()
         self.end_timer.timeout.connect(self._check_end_time)
         self.aspect_ratio: Optional[str] = None
@@ -60,7 +62,10 @@ class VLCPlayer:
         self._preview_update_timer.setSingleShot(True)
         self._preview_update_timer.timeout.connect(self._update_preview_debounced)
         self._pending_color_params = None  # Параметры для отложенного обновления
-        self._preview_thread: Optional[QThread] = None  # Текущий поток создания предпросмотра
+        self._preview_thread: Optional[QThread] = None
+        self._ffmpeg_preview_delay_ms: int = 450
+        self._preview_generation_counter: int = 0
+        self._active_preview_request_id: Optional[int] = None  # Текущий поток создания предпросмотра
         
         try:
             # Создаем instance с опциями для поддержки фильтров
@@ -238,7 +243,7 @@ class VLCPlayer:
         except Exception as e:
             logger.error(f"Ошибка установки соотношения сторон: {e}")
     
-    def play_file(self, file_path: Path, start_time: float = 0.0, end_time: float = 0.0):
+    def play_file(self, file_path: Path, start_time: float = 0.0, end_time: float = 0.0, auto_play: bool = True):
         """
         Воспроизводит файл с указанным временным диапазоном.
         
@@ -246,6 +251,7 @@ class VLCPlayer:
             file_path: Путь к видео файлу
             start_time: Время начала в секундах
             end_time: Время окончания в секундах (0 = до конца)
+            auto_play: Автоматически запускать воспроизведение (по умолчанию True)
         """
         if not self.player:
             logger.error("VLC плеер не инициализирован")
@@ -360,15 +366,16 @@ class VLCPlayer:
             if start_time > 0:
                 self.player.set_time(int(start_time * 1000))
             
-            # Воспроизведение
-            self.player.play()
+            # Воспроизведение (если включено)
+            if auto_play:
+                self.player.play()
             
             # Если указано время окончания и оно больше 0, запускаем таймер для остановки
             # Если end_time = 0, значит воспроизводим до конца
             if end_time > 0 and end_time > start_time:
                 self._setup_end_time_handler(end_time)
             
-            logger.info(f"Воспроизведение: {file_path} ({start_time}s - {end_time}s)")
+            logger.info(f"Файл загружен: {file_path} ({start_time}s - {end_time}s), auto_play={auto_play}")
             return True
         
         except Exception as e:
@@ -583,13 +590,13 @@ class VLCPlayer:
         return 1.0
     
     class PreviewThread(QThread):
-        """Поток для создания предпросмотра с FFmpeg фильтрами."""
-        preview_ready = Signal(Path)
-        preview_failed = Signal(str)
+        """Рабочий поток подготовки предпросмотра с фильтрами FFmpeg."""
+        preview_ready = Signal(Path, int)
+        preview_failed = Signal(str, int)
         
-        def __init__(self, ffmpeg_worker, input_file, start_time, end_time, brightness, contrast, 
+        def __init__(self, ffmpeg_worker, input_file, start_time, end_time, brightness, contrast,
                      saturation, sharpness, shadows, temperature, tint, aspect_ratio, speed,
-                     video_width, video_height, temp_file_path):
+                     video_width, video_height, temp_file_path, request_id: int):
             super().__init__()
             self.ffmpeg_worker = ffmpeg_worker
             self.input_file = input_file
@@ -607,11 +614,11 @@ class VLCPlayer:
             self.video_width = video_width
             self.video_height = video_height
             self.temp_file_path = temp_file_path
+            self.request_id = request_id
         
         def run(self):
-            """Создает предпросмотр в отдельном потоке."""
+            """Создает временный файл предпросмотра в отдельном потоке."""
             try:
-                # Используем FFmpegWorker для создания предпросмотра
                 preview_profile = {
                     "codec": "libx264",
                     "preset": "ultrafast",
@@ -620,13 +627,12 @@ class VLCPlayer:
                     "audio_bitrate": "128k"
                 }
                 
-                # Вычисляем длительность
                 input_duration = self.end_time - self.start_time if self.end_time > self.start_time else 0.0
                 if input_duration <= 0:
-                    input_duration = 10.0
-                    self.end_time = self.start_time + input_duration
+                    input_duration = 3.0
+                input_duration = max(2.0, min(input_duration, 6.0))
+                self.end_time = self.start_time + input_duration
                 
-                # Создаем команду FFmpeg
                 cmd = self.ffmpeg_worker.build_command(
                     input_file=self.input_file,
                     output_file=self.temp_file_path,
@@ -647,8 +653,7 @@ class VLCPlayer:
                     tint=self.tint
                 )
                 
-                # Запускаем FFmpeg
-                logger.info(f"Создание предпросмотра с FFmpeg фильтрами: {self.temp_file_path}")
+                logger.info(f"Запуск FFmpeg для предпросмотра: {self.temp_file_path}")
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -656,42 +661,56 @@ class VLCPlayer:
                     universal_newlines=True
                 )
                 
-                # Ждем завершения (с таймаутом)
                 try:
-                    stdout, stderr = process.communicate(timeout=30)
+                    while True:
+                        try:
+                            stdout, stderr = process.communicate(timeout=0.5)
+                            break
+                        except subprocess.TimeoutExpired:
+                            if self.isInterruptionRequested():
+                                logger.debug("FFmpeg-предпросмотр прерван по запросу")
+                                process.kill()
+                                try:
+                                    process.communicate(timeout=2)
+                                except Exception:
+                                    pass
+                                if self.temp_file_path.exists():
+                                    try:
+                                        self.temp_file_path.unlink()
+                                    except Exception:
+                                        pass
+                                return
+                
                     if process.returncode == 0 and self.temp_file_path.exists():
                         logger.info(f"Предпросмотр создан: {self.temp_file_path}")
-                        self.preview_ready.emit(self.temp_file_path)
+                        self.preview_ready.emit(self.temp_file_path, self.request_id)
                     else:
                         error_msg = stderr if stderr else "Неизвестная ошибка"
                         logger.error(f"Ошибка создания предпросмотра: {error_msg}")
-                        self.preview_failed.emit(error_msg)
+                        self.preview_failed.emit(error_msg, self.request_id)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    logger.error("Таймаут при создании предпросмотра")
-                    self.preview_failed.emit("Таймаут при создании предпросмотра")
-                    
+                    logger.error("Истек таймаут ожидания FFmpeg при создании предпросмотра")
+                    self.preview_failed.emit("Истек таймаут ожидания FFmpeg при создании предпросмотра", self.request_id)
+                
             except Exception as e:
-                logger.error(f"Ошибка создания предпросмотра с FFmpeg: {e}")
-                self.preview_failed.emit(str(e))
-    
+                logger.error(f"Ошибка создания предпросмотра в FFmpeg: {e}")
+                self.preview_failed.emit(str(e), self.request_id)
+
     def _update_preview_debounced(self):
         """Обновляет предпросмотр после задержки (debounce)."""
         if not self._pending_color_params:
             return
-        
+
         params = self._pending_color_params
         self._pending_color_params = None
-        
-        # Используем оригинальный файл для создания предпросмотра, если он есть
+
         input_file = self.original_file if self.original_file and self.original_file.exists() else self.current_file
         if not input_file or not input_file.exists():
             return
-        
-        # Получаем текущую скорость
+
         current_rate = self.get_rate()
-        
-        # Вычисляем end_time для предпросмотра
+
         preview_end_time = self.end_time if self.end_time > self.start_time else 0.0
         if preview_end_time == 0.0:
             video_length = self.get_length()
@@ -699,48 +718,37 @@ class VLCPlayer:
                 preview_end_time = min(self.start_time + 10.0, video_length)
             else:
                 preview_end_time = self.start_time + 10.0
-        
-        # Останавливаем воспроизведение перед удалением старого файла
+
         was_playing = self.is_playing()
         if was_playing:
             self.stop()
-        
-        # Ждем, пока VLC освободит файл
-        if self.preview_temp_file and self.preview_temp_file.exists():
-            # Пробуем удалить файл с несколькими попытками
-            max_attempts = 5
-            for attempt in range(max_attempts):
-                try:
-                    # Даем задержку перед каждой попыткой
-                    time.sleep(0.2)
-                    self.preview_temp_file.unlink()
-                    logger.debug(f"Старый файл предпросмотра удален: {self.preview_temp_file}")
-                    break
-                except Exception as e:
-                    if attempt < max_attempts - 1:
-                        logger.debug(f"Попытка {attempt + 1}/{max_attempts} удаления файла не удалась, повторяю...")
-                    else:
-                        logger.warning(f"Не удалось удалить старый файл предпросмотра после {max_attempts} попыток: {e}")
-                        # Если не удалось удалить, просто пропускаем - новый файл будет с другим именем
-        
-        # Создаем новый временный файл с уникальным именем (добавляем timestamp)
+
+        old_preview = self.preview_temp_file
         temp_dir = tempfile.gettempdir()
-        timestamp = int(time.time() * 1000)  # Миллисекунды для уникальности
+        timestamp = int(time.time() * 1000)
         temp_file = Path(temp_dir) / f"videocutter_preview_{id(self)}_{timestamp}.mp4"
-        self.preview_temp_file = temp_file
-        
-        # Останавливаем предыдущий поток, если он еще работает
+
         if self._preview_thread and self._preview_thread.isRunning():
-            logger.debug("Отменяем предыдущий поток создания предпросмотра")
-            self._preview_thread.terminate()
-            if not self._preview_thread.wait(2000):  # Ждем до 2 секунд
-                logger.warning("Предыдущий поток не завершился вовремя, принудительно завершаем")
-                self._preview_thread.terminate()
-        
-        # Создаем поток для создания предпросмотра
+            logger.debug("Запрашиваем прерывание предыдущего FFmpeg-предпросмотра")
+            self._preview_thread.requestInterruption()
+            if old_preview:
+                self._cleanup_preview_file(old_preview)
+        else:
+            if old_preview:
+                self._cleanup_preview_file(old_preview)
+
+        self.preview_temp_file = temp_file
+
+        if self.on_preview_start:
+            QTimer.singleShot(0, self.on_preview_start)
+
+        request_id = self._preview_generation_counter + 1
+        self._preview_generation_counter = request_id
+        self._active_preview_request_id = request_id
+
         self._preview_thread = self.PreviewThread(
             self.ffmpeg_worker,
-            input_file,  # Используем оригинальный файл, а не текущий (который может быть временным)
+            input_file,
             self.start_time,
             preview_end_time,
             params['brightness'],
@@ -754,32 +762,49 @@ class VLCPlayer:
             current_rate,
             self.video_width,
             self.video_height,
-            temp_file
+            temp_file,
+            request_id
         )
         self._preview_thread.preview_ready.connect(self._on_preview_ready)
         self._preview_thread.preview_failed.connect(self._on_preview_failed)
+        self._preview_thread.finished.connect(lambda rid=request_id: self._on_preview_thread_finished(rid))
         self._preview_thread.start()
-    
-    def _on_preview_ready(self, preview_file: Path):
-        """Обработчик успешного создания предпросмотра."""
+
+    def _on_preview_thread_finished(self, request_id: int):
+        """Сбрасывает ссылку на поток после завершения генерации."""
+        if self._active_preview_request_id == request_id:
+            self._preview_thread = None
+            self._active_preview_request_id = None
+
+    def _on_preview_ready(self, preview_file: Path, request_id: int):
+        """Обрабатывает успешное создание FFmpeg-предпросмотра."""
+        if request_id != self._active_preview_request_id:
+            logger.debug("Старый результат FFmpeg-предпросмотра проигнорирован")
+            self._cleanup_preview_file(preview_file)
+            return
+
+        if not self.use_ffmpeg_preview:
+            logger.debug("Режим FFmpeg предпросмотра отключен — игнорируем готовый файл")
+            self._cleanup_preview_file(preview_file)
+            return
+
+        if self.on_preview_end:
+            self.on_preview_end()
+
         if preview_file and preview_file.exists():
-            # Воспроизводим временный файл
+            self._preview_thread = None
+            self.preview_temp_file = preview_file
+            self._active_preview_request_id = request_id
+
             was_playing = self.is_playing()
-            # Сохраняем позицию относительно оригинального файла
             original_pos = self.get_time()
-            
-            # Останавливаем текущее воспроизведение
+
             self.stop()
-            
-            # Загружаем новый файл (временный предпросмотр начинается с 0)
-            self.play_file(preview_file, 0.0, 0.0)
-            
-            # Восстанавливаем позицию относительно временного файла
-            # Временный файл начинается с start_time оригинального файла
-            # Поэтому позиция в временном файле = original_pos - start_time
+            self.play_file(preview_file, 0.0, 0.0, auto_play=was_playing)
+
             if original_pos > 0 and self.start_time >= 0:
                 preview_pos = max(0.0, original_pos - self.start_time)
-                # Используем несколько попыток для установки позиции
+
                 def set_pos_retry(attempt=0):
                     if attempt < 5 and self.player:
                         try:
@@ -788,36 +813,72 @@ class VLCPlayer:
                                 self.set_time(preview_pos)
                             elif attempt < 4:
                                 QTimer.singleShot(200, lambda: set_pos_retry(attempt + 1))
-                        except:
+                        except Exception:
                             if attempt < 4:
                                 QTimer.singleShot(200, lambda: set_pos_retry(attempt + 1))
+
                 QTimer.singleShot(300, lambda: set_pos_retry())
-            
-            if was_playing:
-                QTimer.singleShot(500, lambda: self.play() if self.player else None)
-            
-            # ВАЖНО: Отключаем video_adjust, чтобы не "удваивать" коррекцию
-            try:
-                if hasattr(self.player, 'video_set_adjust_float'):
-                    self.player.video_set_adjust_float(vlc.VideoAdjustOption.Enable, 0.0)
-                elif hasattr(self.player, 'video_set_adjust_int'):
-                    self.player.video_set_adjust_int(vlc.VideoAdjustOption.Enable, 0)
-            except Exception:
-                pass
-            
-            logger.info("Предпросмотр обновлен с применением FFmpeg фильтров")
-    
-    def _on_preview_failed(self, error_msg: str):
-        """Обработчик ошибки создания предпросмотра."""
+
+            self._disable_vlc_color_adjustments()
+            logger.info("Предпросмотр обновлен с применением FFmpeg-фильтров")
+
+    def _on_preview_failed(self, error_msg: str, request_id: int):
+        """Обрабатывает ошибку генерации FFmpeg-предпросмотра."""
+        if request_id != self._active_preview_request_id:
+            logger.debug("Игнорируем ошибку устаревшего FFmpeg-предпросмотра")
+            return
+
+        if self.on_preview_end:
+            self.on_preview_end()
+
         logger.error(f"Не удалось создать предпросмотр: {error_msg}")
-        # Fallback: используем стандартный метод VLC
         self.use_ffmpeg_preview = False
-        # Применяем цветокоррекцию через VLC
+        self._preview_thread = None
+        self._cleanup_preview_file()
+        self._active_preview_request_id = None
+        self._disable_vlc_color_adjustments()
         self._apply_vlc_color_correction(
             self.brightness, self.contrast, self.saturation, 
             self.sharpness, self.shadows, self.temperature, self.tint
         )
     
+    def _color_preview_requires_ffmpeg(self, sharpness: float, shadows: float) -> bool:
+        """Возвращает True, если предпросмотру нужен FFmpeg."""
+        return abs(sharpness) >= 0.01 or abs(shadows) >= 0.01
+
+    def _disable_vlc_color_adjustments(self):
+        """Сбрасывает настройки video_adjust в VLC."""
+        if not self.player:
+            return
+        try:
+            if hasattr(self.player, "video_set_adjust_float"):
+                self.player.video_set_adjust_float(vlc.VideoAdjustOption.Enable, 0.0)
+            elif hasattr(self.player, "video_set_adjust_int"):
+                self.player.video_set_adjust_int(vlc.VideoAdjustOption.Enable, 0)
+        except Exception as exc:
+            logger.debug(f"Не удалось отключить video_adjust VLC: {exc}")
+
+    def _cleanup_preview_file(self, path: Optional[Path] = None, retries: int = 5, delay: float = 0.2):
+        """Удаляет временный файл предпросмотра, если он существует."""
+        target = path or self.preview_temp_file
+        if not target:
+            return
+
+        for attempt in range(retries):
+            if not target.exists():
+                break
+            try:
+                target.unlink()
+                logger.debug(f"Удален временный файл предпросмотра: {target}")
+                break
+            except Exception as exc:
+                if attempt == retries - 1:
+                    logger.debug(f"Не удалось удалить временный файл предпросмотра: {exc}")
+                time.sleep(delay)
+
+        if path is None:
+            self.preview_temp_file = None
+
     def set_color_correction(
         self,
         brightness: float = 0.0,
@@ -828,41 +889,27 @@ class VLCPlayer:
         temperature: float = 0.0,
         tint: float = 0.0
     ):
-        """
-        Применяет настройки цветокоррекции к предпросмотру.
-        
-        Args:
-            brightness: Яркость (-1.0 до 1.0)
-            contrast: Контрастность (0.0 до 2.0)
-            saturation: Насыщенность (0.0 до 2.0)
-            sharpness: Резкость (-1.0 до 1.0)
-            shadows: Тени (-1.0 до 1.0, преобразуется в gamma)
-            temperature: Температура (-100 до 100)
-            tint: Тон (-100 до 100)
-        """
+        """Применяет настройки цветокоррекции к предпросмотру."""
         if not self.player or not self.current_file:
             return
-        
-        # Сохраняем параметры
+
         self.brightness = brightness
         self.contrast = contrast
         self.saturation = saturation
         self.sharpness = sharpness
-        self.shadows = shadows  # Сохраняем shadows для fallback
+        self.shadows = shadows
         self.temperature = temperature
         self.tint = tint
-        
-        # Преобразуем shadows в gamma для VLC
-        # shadows > 0 осветляет тени (gamma < 1.0), shadows < 0 затемняет (gamma > 1.0)
-        # VLC использует gamma от 0.01 до 10.0
+
         if abs(shadows) >= 0.01:
-            self.gamma = max(0.01, min(10.0, 1.0 / (1.0 + shadows * 0.5)))
+            self.gamma = max(0.01, min(10.0, 1.0 + shadows * 0.5))
         else:
             self.gamma = 1.0
-        
-        # Если используем FFmpeg для предпросмотра, планируем обновление с задержкой (debounce)
-        if self.use_ffmpeg_preview:
-            # Сохраняем параметры для отложенного обновления
+
+        needs_ffmpeg_preview = self._color_preview_requires_ffmpeg(sharpness, shadows)
+
+        if needs_ffmpeg_preview:
+            self.use_ffmpeg_preview = True
             self._pending_color_params = {
                 'brightness': brightness,
                 'contrast': contrast,
@@ -873,14 +920,21 @@ class VLCPlayer:
                 'tint': tint,
                 'aspect_ratio': self.aspect_ratio or "16:9"
             }
-            # Перезапускаем таймер (debounce: обновляем только после остановки движения слайдера)
             self._preview_update_timer.stop()
-            # Увеличиваем задержку до 1.5 секунд для уменьшения нагрузки
-            self._preview_update_timer.start(1500)  # 1.5 секунды задержка
+            self._preview_update_timer.start(self._ffmpeg_preview_delay_ms)
             return
-        
-        # Иначе используем стандартный метод VLC
-        self._apply_vlc_color_correction(brightness, contrast, saturation, sharpness, shadows, temperature, tint)
+
+        if self.use_ffmpeg_preview:
+            self.use_ffmpeg_preview = False
+            self._preview_update_timer.stop()
+            self._pending_color_params = None
+            self._active_preview_request_id = None
+            self._cleanup_preview_file()
+            self._disable_vlc_color_adjustments()
+
+        self._apply_vlc_color_correction(
+            brightness, contrast, saturation, sharpness, shadows, temperature, tint
+        )
     
     def _apply_vlc_color_correction(
         self,
@@ -899,7 +953,8 @@ class VLCPlayer:
                 abs(brightness) >= 0.01 or
                 abs(contrast - 1.0) >= 0.01 or
                 abs(saturation - 1.0) >= 0.01 or
-                abs(self.gamma - 1.0) >= 0.01 or
+                abs(self.gamma - 1.0) >= 0.005 or
+                abs(shadows) >= 0.01 or
                 abs(tint) >= 0.01 or
                 abs(temperature) >= 0.01
             )
@@ -983,7 +1038,7 @@ class VLCPlayer:
                 logger.debug(f"Не удалось применить значения через video_adjust: {e}")
             
             logger.info(f"Применена цветокоррекция: brightness={brightness:.2f}, contrast={contrast:.2f}, "
-                       f"saturation={saturation:.2f}, shadows={shadows:.2f}, temperature={temperature}, tint={tint}")
+                       f"saturation={saturation:.2f}, sharpness={sharpness:.2f}, shadows={shadows:.2f}, temperature={temperature}, tint={tint}")
             
         except Exception as e:
             logger.error(f"Ошибка применения цветокоррекции: {e}")
@@ -1012,4 +1067,3 @@ class VLCPlayer:
                 logger.info(f"Временный файл предпросмотра удален: {self.preview_temp_file}")
             except Exception as e:
                 logger.warning(f"Не удалось удалить временный файл предпросмотра: {e}")
-
