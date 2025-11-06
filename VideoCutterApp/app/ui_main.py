@@ -260,14 +260,25 @@ class MainWindow(QMainWindow):
         
         # Группа выбора файла
         file_group = QGroupBox("Выбор видео файла")
-        file_layout = QHBoxLayout()
+        file_layout = QVBoxLayout()
         
+        # Поле ввода и кнопка
+        file_input_layout = QHBoxLayout()
         self.input_file_edit = QLineEdit()
         self.input_file_edit.setPlaceholderText("Выберите входной видео файл...")
         self.input_file_btn = QPushButton("Обзор...")
         
-        file_layout.addWidget(self.input_file_edit)
-        file_layout.addWidget(self.input_file_btn)
+        file_input_layout.addWidget(self.input_file_edit)
+        file_input_layout.addWidget(self.input_file_btn)
+        file_layout.addLayout(file_input_layout)
+        
+        # Метаданные видео (мелким шрифтом)
+        self.video_metadata_label = QLabel("")
+        self.video_metadata_label.setStyleSheet("color: gray; font-size: 9pt;")
+        self.video_metadata_label.setWordWrap(True)
+        self.video_metadata_label.setVisible(False)  # Скрыт по умолчанию
+        file_layout.addWidget(self.video_metadata_label)
+        
         file_group.setLayout(file_layout)
         
         # Группа настроек времени
@@ -585,6 +596,8 @@ class MainWindow(QMainWindow):
         
         if file_path:
             self.input_file_edit.setText(file_path)
+            # Сбрасываем метаданные перед загрузкой нового файла
+            self.video_metadata_label.setVisible(False)
             self.load_video_info(file_path)
             self.auto_set_output_path(file_path)
     
@@ -598,6 +611,9 @@ class MainWindow(QMainWindow):
             self.end_time_edit.setText(seconds_to_timecode(duration))
             self.log(f"Загружено видео: длительность {seconds_to_timecode(duration)}, "
                     f"FPS: {self.video_info.get('fps', 0):.2f}")
+            
+            # Обновляем метаданные видео
+            self._update_video_metadata(video_path)
             
             # Обновляем размер виджета в соответствии с текущим соотношением сторон
             self._update_video_widget_size()
@@ -621,6 +637,8 @@ class MainWindow(QMainWindow):
                 # Небольшая задержка, чтобы убедиться, что виджет готов
                 QTimer.singleShot(200, lambda: self._auto_preview(video_path, duration))
         else:
+            # Скрываем метаданные, если не удалось загрузить видео
+            self.video_metadata_label.setVisible(False)
             QMessageBox.warning(self, "Ошибка", "Не удалось загрузить информацию о видео")
     
     def _auto_preview(self, video_path: Path, duration: float):
@@ -1210,6 +1228,43 @@ class MainWindow(QMainWindow):
                 if not was_playing:
                     self.player.pause()
     
+    def _update_video_metadata(self, video_path: Path):
+        """Обновляет отображение метаданных видео."""
+        if not video_path.exists():
+            self.video_metadata_label.setVisible(False)
+            return
+        
+        try:
+            # Получаем размер файла
+            file_size = video_path.stat().st_size
+            # Преобразуем размер в читаемый формат
+            if file_size < 1024:
+                size_str = f"{file_size} B"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.2f} KB"
+            elif file_size < 1024 * 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024):.2f} MB"
+            else:
+                size_str = f"{file_size / (1024 * 1024 * 1024):.2f} GB"
+            
+            # Получаем название файла
+            file_name = video_path.name
+            
+            # Получаем формат (расширение)
+            file_format = video_path.suffix.upper().lstrip('.') or "Unknown"
+            
+            # Получаем длительность
+            duration = self.video_info.get("duration", 0) if self.video_info else 0
+            duration_str = seconds_to_timecode(duration) if duration > 0 else "N/A"
+            
+            # Формируем строку метаданных
+            metadata_text = f"📹 {file_name} | 💾 {size_str} | 🎬 {file_format} | ⏱ {duration_str}"
+            self.video_metadata_label.setText(metadata_text)
+            self.video_metadata_label.setVisible(True)
+        except Exception as e:
+            logger.warning(f"Не удалось обновить метаданные видео: {e}")
+            self.video_metadata_label.setVisible(False)
+    
     def _update_video_widget_size(self, aspect_ratio: str = None):
         """Обновляет минимальный размер виджета видео в соответствии с соотношением сторон."""
         if not self.video_widget:
@@ -1398,6 +1453,8 @@ class MainWindow(QMainWindow):
                 # Загружаем видео файл проекта
                 if project.input_file.exists():
                     self.input_file_edit.setText(str(project.input_file))
+                    # Сбрасываем метаданные перед загрузкой
+                    self.video_metadata_label.setVisible(False)
                     self.load_video_info(str(project.input_file))
                 else:
                     QMessageBox.warning(self, "Предупреждение", 
