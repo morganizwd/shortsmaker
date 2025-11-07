@@ -1281,9 +1281,23 @@ class MainWindow(QMainWindow):
             # Получаем длительность
             duration = self.video_info.get("duration", 0) if self.video_info else 0
             duration_str = seconds_to_timecode(duration) if duration > 0 else "N/A"
+
+            # Получаем разрешение
+            width = self.video_info.get("width", 0) if self.video_info else 0
+            height = self.video_info.get("height", 0) if self.video_info else 0
+            try:
+                width = int(width)
+                height = int(height)
+            except (TypeError, ValueError):
+                width = 0
+                height = 0
+
+            resolution_str = f"{width}x{height}" if width > 0 and height > 0 else "N/A"
             
             # Формируем строку метаданных
-            metadata_text = f"📹 {file_name} | 💾 {size_str} | 🎬 {file_format} | ⏱ {duration_str}"
+            metadata_text = (
+                f"📹 {file_name} | 💾 {size_str} | 📐 {resolution_str} | 🎬 {file_format} | ⏱ {duration_str}"
+            )
             self.video_metadata_label.setText(metadata_text)
             self.video_metadata_label.setVisible(True)
         except Exception as e:
